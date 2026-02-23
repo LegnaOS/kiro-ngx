@@ -12,14 +12,14 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # 需要跳过的包裹字符（当 thinking 标签被这些字符包裹时，认为是引用而非真正标签）
-QUOTE_CHARS = set(b'`"\'\\#!@$%^&*()-_=+[]{};:<>,.?/')
+QUOTE_CHARS = {ord(c) for c in '`"\'\\#!@$%^&*()-_=+[]{};:<>,.?/'}
 
 CONTEXT_WINDOW_SIZE = 200_000
 
 
 def _is_quote_char(buffer: str, pos: int) -> bool:
     if 0 <= pos < len(buffer):
-        return ord(buffer[pos]) < 128 and buffer[pos].encode("ascii")[0] in QUOTE_CHARS
+        return ord(buffer[pos]) < 128 and ord(buffer[pos]) in QUOTE_CHARS
     return False
 
 
@@ -188,17 +188,8 @@ class SseStateManager:
 
 
 def estimate_tokens(text: str) -> int:
-    """简单的 token 估算：中文 ~1.5 chars/token, 英文 ~4 chars/token"""
-    chinese_count = 0
-    other_count = 0
-    for c in text:
-        if "\u4e00" <= c <= "\u9fff":
-            chinese_count += 1
-        else:
-            other_count += 1
-    chinese_tokens = (chinese_count * 2 + 2) // 3
-    other_tokens = (other_count + 3) // 4
-    return max(chinese_tokens + other_tokens, 1)
+    """基于 UTF-8 字节长度的 token 近似估算（utf8_len / 4）"""
+    return max(len(text.encode("utf-8")) // 4, 1)
 
 
 class StreamContext:
@@ -219,9 +210,14 @@ class StreamContext:
         self.thinking_block_index: Optional[int] = None
         self.text_block_index: Optional[int] = None
         self._strip_thinking_leading_newline = False
-        self.accumulated_text = ""  # 累积文本，用于日志记录
+        self._accumulated_text_parts: List[str] = []  # 累积文本片段，用于日志记录
         self.web_search_tool_uses: List[Dict[str, Any]] = []  # 记录 web_search tool_use
         self._tool_json_buffers: Dict[str, str] = {}  # tool_use_id → 累积的 JSON 字符串
+
+    @property
+    def accumulated_text(self) -> str:
+        """延迟 join 累积文本"""
+        return "".join(self._accumulated_text_parts)
 
     def create_message_start_event(self) -> dict:
         return {
@@ -358,7 +354,7 @@ class StreamContext:
 
     def _create_text_delta_events(self, text: str) -> List[SseEvent]:
         events: List[SseEvent] = []
-        self.accumulated_text += text  # 累积文本用于日志
+        self._accumulated_text_parts.append(text)  # 累积文本用于日志
         # 如果当前 text block 已被关闭，丢弃索引
         if self.text_block_index is not None:
             if not self.state_manager._is_block_open_of_type(self.text_block_index, "text"):

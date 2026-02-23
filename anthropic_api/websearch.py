@@ -257,9 +257,8 @@ def _generate_websearch_events(
     }))
     summary = _generate_search_summary(query, search_results)
     chunk_size = 100
-    chars = list(summary)
-    for ci in range(0, len(chars), chunk_size):
-        chunk = "".join(chars[ci:ci + chunk_size])
+    for ci in range(0, len(summary), chunk_size):
+        chunk = summary[ci:ci + chunk_size]
         events.append(SseEvent("content_block_delta", {
             "type": "content_block_delta", "index": 2,
             "delta": {"type": "text_delta", "text": chunk},

@@ -8,7 +8,7 @@
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from http_client import ProxyConfig, build_sync_client
@@ -16,6 +16,15 @@ from http_client import ProxyConfig, build_sync_client
 logger = logging.getLogger(__name__)
 
 _config: Optional["CountTokensConfig"] = None
+
+# 西文字符码点区间（已合并连续区间）
+_WESTERN_RANGES = (
+    (0x0000, 0x024F),
+    (0x1E00, 0x1EFF),
+    (0x2C60, 0x2C7F),
+    (0xA720, 0xA7FF),
+    (0xAB30, 0xAB6F),
+)
 
 
 @dataclass
@@ -34,31 +43,44 @@ def init_config(config: CountTokensConfig) -> None:
 def is_non_western_char(c: str) -> bool:
     """判断字符是否为非西文字符"""
     cp = ord(c)
-    western_ranges = [
-        (0x0000, 0x007F), (0x0080, 0x00FF), (0x0100, 0x024F),
-        (0x1E00, 0x1EFF), (0x2C60, 0x2C7F), (0xA720, 0xA7FF),
-        (0xAB30, 0xAB6F),
-    ]
-    return not any(lo <= cp <= hi for lo, hi in western_ranges)
+    # 纯 ASCII 快速路径
+    if cp <= 0x7F:
+        return False
+    for lo, hi in _WESTERN_RANGES:
+        if cp <= hi:
+            return cp < lo
+    return True
 
 
 def count_tokens(text: str) -> int:
     """计算文本的 token 数量"""
-    char_units = sum(4.0 if is_non_western_char(c) else 1.0 for c in text)
-    tokens = char_units / 4.0
+    # 整数累加：非西文 +4，西文 +1，最后整除 4
+    units = 0
+    for c in text:
+        cp = ord(c)
+        if cp <= 0x7F:
+            units += 1
+        else:
+            western = False
+            for lo, hi in _WESTERN_RANGES:
+                if cp <= hi:
+                    western = cp >= lo
+                    break
+            units += 1 if western else 4
+    tokens = units // 4
 
     if tokens < 100:
-        acc = tokens * 1.5
+        acc = tokens * 15 // 10
     elif tokens < 200:
-        acc = tokens * 1.3
+        acc = tokens * 13 // 10
     elif tokens < 300:
-        acc = tokens * 1.25
+        acc = tokens * 125 // 100
     elif tokens < 800:
-        acc = tokens * 1.2
+        acc = tokens * 12 // 10
     else:
-        acc = tokens * 1.0
+        acc = tokens
 
-    return max(int(acc), 1)
+    return max(acc, 1)
 
 
 def count_all_tokens(
@@ -106,6 +128,27 @@ def _call_remote_count_tokens(
     return resp.json().get("input_tokens", 1)
 
 
+def _estimate_schema_tokens(obj: Any) -> int:
+    """递归估算 schema 对象的 token 数，避免 json.dumps 开销"""
+    if isinstance(obj, str):
+        return count_tokens(obj)
+    if isinstance(obj, bool):
+        return 1
+    if isinstance(obj, (int, float)):
+        return 1
+    if isinstance(obj, dict):
+        total = 0
+        for k, v in obj.items():
+            total += count_tokens(k) + _estimate_schema_tokens(v)
+        return total
+    if isinstance(obj, list):
+        total = 0
+        for item in obj:
+            total += _estimate_schema_tokens(item)
+        return total
+    return 1
+
+
 def _count_all_tokens_local(
     system: Optional[List[Dict[str, str]]],
     messages: List[Dict[str, Any]],
@@ -130,7 +173,7 @@ def _count_all_tokens_local(
             total += count_tokens(tool.get("name", ""))
             total += count_tokens(tool.get("description", ""))
             schema = tool.get("input_schema", {})
-            total += count_tokens(json.dumps(schema, ensure_ascii=False))
+            total += _estimate_schema_tokens(schema)
 
     return max(total, 1)
 

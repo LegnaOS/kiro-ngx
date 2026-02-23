@@ -1,10 +1,14 @@
 import { useState, useEffect } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Power, Download, Home, KeyRound, Settings, ScrollText } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Power, Download, Home, KeyRound, Settings, ScrollText, AlertTriangle } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import {
+  Dialog, DialogContent, DialogHeader, DialogFooter,
+  DialogTitle, DialogDescription,
+} from '@/components/ui/dialog'
 import { useCredentials } from '@/hooks/use-credentials'
 import { restartServer, updateAndRestart, getVersionInfo, getLogStatus, setLogStatus, type VersionInfo } from '@/api/credentials'
 import { HomeTab } from '@/components/tabs/home-tab'
@@ -30,6 +34,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [updating, setUpdating] = useState(false)
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
   const [logEnabled, setLogEnabled] = useState(false)
+  const [confirmAction, setConfirmAction] = useState<'restart' | 'update' | null>(null)
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
@@ -59,6 +64,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   const handleRestart = async () => {
+    setConfirmAction(null)
     setRestarting(true)
     toast.info('正在重启...')
     const r = await restartServer()
@@ -68,6 +74,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   const handleUpdate = async () => {
+    setConfirmAction(null)
     setUpdating(true)
     toast.info('正在更新...')
     const r = await updateAndRestart()
@@ -112,7 +119,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <span className="font-semibold">Kiro Admin</span>
               {versionInfo && <span className="text-xs text-muted-foreground">v{versionInfo.current}</span>}
               {versionInfo?.hasUpdate && (
-                <Badge variant="outline" className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950" onClick={handleUpdate}>
+                <Badge variant="outline" className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950" onClick={() => setConfirmAction('update')}>
                   v{versionInfo.latest} 可用
                 </Badge>
               )}
@@ -142,10 +149,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleUpdate} disabled={updating || restarting} title="更新">
+            <Button variant="ghost" size="icon" onClick={() => setConfirmAction('update')} disabled={updating || restarting} title="更新">
               <Download className={`h-5 w-5 ${updating ? 'animate-bounce' : versionInfo?.hasUpdate ? 'text-orange-500' : ''}`} />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRestart} disabled={restarting || updating} title="重启">
+            <Button variant="ghost" size="icon" onClick={() => setConfirmAction('restart')} disabled={restarting || updating} title="重启">
               <Power className={`h-5 w-5 ${restarting ? 'animate-spin' : ''}`} />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
@@ -166,6 +173,34 @@ export function Dashboard({ onLogout }: DashboardProps) {
         {activeTab === 'credentials' && <CredentialsTab />}
         {activeTab === 'strategy' && <StrategyTab />}
       </main>
+
+      {/* 重启/更新确认对话框 */}
+      <Dialog open={confirmAction !== null} onOpenChange={open => { if (!open) setConfirmAction(null) }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-full bg-orange-100 dark:bg-orange-900/30">
+              <AlertTriangle className="h-6 w-6 text-orange-500" />
+            </div>
+            <DialogTitle className="text-center">
+              {confirmAction === 'restart' ? '确认重启服务器' : '确认更新并重启'}
+            </DialogTitle>
+            <DialogDescription className="text-center">
+              {confirmAction === 'restart'
+                ? '重启期间所有连接将中断，正在进行的请求会丢失。确定继续吗？'
+                : '将从远程拉取最新版本并重启服务器，期间服务不可用。确定继续吗？'}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="flex gap-2 sm:justify-center">
+            <Button variant="outline" onClick={() => setConfirmAction(null)}>取消</Button>
+            <Button
+              variant="destructive"
+              onClick={confirmAction === 'restart' ? handleRestart : handleUpdate}
+            >
+              {confirmAction === 'restart' ? '重启' : '更新并重启'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -105,8 +105,11 @@ def _extract_session_id(user_id: str) -> Optional[str]:
     return None
 
 
+_IMAGE_FORMAT_MAP = {"image/jpeg": "jpeg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+
+
 def _get_image_format(media_type: str) -> Optional[str]:
-    return {"image/jpeg": "jpeg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}.get(media_type)
+    return _IMAGE_FORMAT_MAP.get(media_type)
 
 
 def _extract_tool_result_content(content: Any) -> str:
@@ -329,55 +332,42 @@ def _merge_user_messages(messages: List[AnthropicMessage], model_id: str) -> His
     return HistoryUserMessage(user_input_message=user_msg)
 
 
-def _collect_history_tool_names(history: List[Message]) -> List[str]:
-    """收集历史消息中使用的所有工具名称"""
+def _process_history_tools(
+    history: List[Message], current_tool_results: List[ToolResult],
+) -> Tuple[List[str], List[ToolResult]]:
+    """一次遍历完成：收集 tool_names、验证 tool_pairing、移除 orphaned tool_uses
+
+    直接访问 _data 属性避免 to_dict() 全量序列化。
+    返回 (history_tool_names, validated_tool_results)。
+    """
     tool_names: List[str] = []
-    for msg in history:
-        d = msg.to_dict()
-        am = d.get("assistantResponseMessage")
-        if not am:
-            continue
-        tool_uses = am.get("toolUses")
-        if not tool_uses:
-            continue
-        for tu in tool_uses:
-            name = tu.get("name", "")
-            if name and name not in tool_names:
-                tool_names.append(name)
-    return tool_names
-# PLACEHOLDER_CONVERTER_PART5
-
-
-def _validate_tool_pairing(
-    history: List[Message], tool_results: List[ToolResult],
-) -> Tuple[List[ToolResult], Set[str]]:
-    """验证 tool_use/tool_result 配对，返回 (过滤后的 tool_results, 孤立的 tool_use_id 集合)"""
+    tool_names_seen: Set[str] = set()
     all_tool_use_ids: Set[str] = set()
     history_tool_result_ids: Set[str] = set()
 
     for msg in history:
-        d = msg.to_dict()
-        # 收集 assistant 消息中的 tool_use_id
-        am = d.get("assistantResponseMessage")
-        if am:
-            for tu in (am.get("toolUses") or []):
-                tid = tu.get("toolUseId", "")
-                if tid:
-                    all_tool_use_ids.add(tid)
-        # 收集历史 user 消息中已有的 tool_result_id
-        um = d.get("userInputMessage")
-        if um:
-            ctx = um.get("userInputMessageContext") or {}
-            for tr in (ctx.get("toolResults") or []):
-                tid = tr.get("toolUseId", "")
-                if tid:
-                    history_tool_result_ids.add(tid)
+        inner = msg._data
+        if isinstance(inner, HistoryAssistantMessage):
+            tool_uses = inner.assistant_response_message.tool_uses
+            if tool_uses:
+                for tu in tool_uses:
+                    if tu.name and tu.name not in tool_names_seen:
+                        tool_names.append(tu.name)
+                        tool_names_seen.add(tu.name)
+                    if tu.tool_use_id:
+                        all_tool_use_ids.add(tu.tool_use_id)
+        elif isinstance(inner, HistoryUserMessage):
+            ctx = inner.user_input_message.user_input_message_context
+            if ctx.tool_results:
+                for tr in ctx.tool_results:
+                    if tr.tool_use_id:
+                        history_tool_result_ids.add(tr.tool_use_id)
 
-    # 未配对的 tool_use_id
+    # 验证 tool_use/tool_result 配对
     unpaired = all_tool_use_ids - history_tool_result_ids
 
     filtered: List[ToolResult] = []
-    for result in tool_results:
+    for result in current_tool_results:
         if result.tool_use_id in unpaired:
             filtered.append(result)
             unpaired.discard(result.tool_use_id)
@@ -386,32 +376,22 @@ def _validate_tool_pairing(
         else:
             logger.warning("跳过孤立的 tool_result: tool_use_id=%s", result.tool_use_id)
 
-    for oid in unpaired:
-        logger.warning("检测到孤立的 tool_use，将从历史中移除: tool_use_id=%s", oid)
+    # 移除孤立的 tool_use
+    if unpaired:
+        for oid in unpaired:
+            logger.warning("检测到孤立的 tool_use，将从历史中移除: tool_use_id=%s", oid)
+        for msg in history:
+            inner = msg._data
+            if not isinstance(inner, HistoryAssistantMessage):
+                continue
+            arm = inner.assistant_response_message
+            if not arm.tool_uses:
+                continue
+            arm.tool_uses = [tu for tu in arm.tool_uses if tu.tool_use_id not in unpaired]
+            if not arm.tool_uses:
+                arm.tool_uses = None
 
-    return filtered, unpaired
-# PLACEHOLDER_CONVERTER_PART6
-
-
-def _remove_orphaned_tool_uses(history: List[Message], orphaned_ids: Set[str]) -> None:
-    """从历史中移除孤立的 tool_use"""
-    if not orphaned_ids:
-        return
-    for msg in history:
-        d = msg.to_dict()
-        am = d.get("assistantResponseMessage")
-        if not am:
-            continue
-        # 直接操作内部对象
-        inner = msg._data
-        if not hasattr(inner, "assistant_response_message"):
-            continue
-        arm = inner.assistant_response_message
-        if not arm.tool_uses:
-            continue
-        arm.tool_uses = [tu for tu in arm.tool_uses if tu.tool_use_id not in orphaned_ids]
-        if not arm.tool_uses:
-            arm.tool_uses = None
+    return tool_names, filtered
 
 
 def _build_history(
@@ -520,12 +500,8 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
     # 构建历史消息（system prompt 在此注入为首对 user+assistant）
     history = _build_history(req, messages, model_id)
 
-    # 验证 tool_use/tool_result 配对
-    validated_tool_results, orphaned_ids = _validate_tool_pairing(history, current_tool_results)
-    _remove_orphaned_tool_uses(history, orphaned_ids)
-
-    # 收集历史工具名称，为缺失的生成占位符
-    history_tool_names = _collect_history_tool_names(history)
+    # 一次遍历：验证 tool pairing + 收集工具名 + 移除孤立 tool_use
+    history_tool_names, validated_tool_results = _process_history_tools(history, current_tool_results)
     existing_names = {t.tool_specification.name.lower() for t in tools}
     for tn in history_tool_names:
         if tn.lower() not in existing_names:

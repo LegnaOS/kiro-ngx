@@ -251,25 +251,24 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
     decoder = EventStreamDecoder()
     decoder.feed(body_bytes)
 
-    text_content = ""
+    text_parts: List[str] = []
     tool_uses: List[Dict[str, Any]] = []
     has_tool_use = False
     stop_reason = "end_turn"
     context_input_tokens: Optional[int] = None
-    tool_json_buffers: Dict[str, str] = {}
+    tool_json_parts: Dict[str, List[str]] = {}
 
     for frame in decoder.decode_all():
         event = _parse_event(frame)
         if event is None:
             continue
         if isinstance(event, AssistantResponseEvent):
-            text_content += event.content
+            text_parts.append(event.content)
         elif isinstance(event, ToolUseEvent):
             has_tool_use = True
-            buf = tool_json_buffers.setdefault(event.tool_use_id, "")
-            buf += event.input
-            tool_json_buffers[event.tool_use_id] = buf
+            tool_json_parts.setdefault(event.tool_use_id, []).append(event.input)
             if event.stop:
+                buf = "".join(tool_json_parts.get(event.tool_use_id, []))
                 try:
                     inp = json.loads(buf) if buf else {}
                 except json.JSONDecodeError:
@@ -288,6 +287,7 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
         stop_reason = "tool_use"
 
     content: List[Dict[str, Any]] = []
+    text_content = "".join(text_parts)
     if text_content:
         content.append({"type": "text", "text": text_content})
     content.extend(tool_uses)
@@ -400,7 +400,7 @@ def _build_continuation_messages(
     search_results_map: Dict[str, str],
 ) -> List[Dict[str, Any]]:
     """构建续接消息：原消息 + assistant(text+tool_use) + user(tool_result)"""
-    messages = copy.deepcopy(original_messages)
+    messages = list(original_messages)
 
     # assistant 消息：文本 + tool_use
     assistant_content: List[Dict[str, Any]] = []
