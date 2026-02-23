@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+
+# 敏感文件 - 不要提交实际凭据和配置
+credentials.json
+config.json
+kiro_stats.json
+kiro_balance_cache.json
+
+# Node / 前端
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/tsconfig.tsbuildinfo
+admin-ui/pnpm-lock.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+CLAUDE.md
