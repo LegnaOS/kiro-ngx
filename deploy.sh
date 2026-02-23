@@ -9,22 +9,37 @@ echo "=== Kiro.py 一键部署 ==="
 echo "[1/4] 拉取最新代码..."
 git pull --ff-only
 
-# Python venv
+# Python venv — 优先使用高版本 Python
+PYTHON_BIN=""
+for py in python3.12 python3.11 python3.10 python3.9 python3; do
+  if command -v "$py" &>/dev/null; then
+    PYTHON_BIN="$py"
+    break
+  fi
+done
+if [ -z "$PYTHON_BIN" ]; then
+  echo "错误: 未找到 python3"; exit 1
+fi
+
 if [ ! -d "venv" ]; then
-  echo "[2/4] 创建虚拟环境..."
-  python3 -m venv venv
+  echo "[2/4] 创建虚拟环境 ($PYTHON_BIN)..."
+  $PYTHON_BIN -m venv venv
 else
   echo "[2/4] 虚拟环境已存在"
 fi
 source venv/bin/activate
 pip install -q -r requirements.txt
 
-# 构建前端
-echo "[3/4] 构建前端..."
-cd admin-ui
-npm install --silent
-npm run build
-cd ..
+# 构建前端（无 npm 则跳过，使用仓库中预编译的 admin-ui-dist）
+if command -v npm &>/dev/null && [ -d "admin-ui" ]; then
+  echo "[3/4] 构建前端..."
+  cd admin-ui
+  npm install --silent
+  npm run build
+  cd ..
+else
+  echo "[3/4] 跳过前端构建（使用预编译版本）"
+fi
 
 # 停止旧进程并启动
 echo "[4/4] 启动服务..."
