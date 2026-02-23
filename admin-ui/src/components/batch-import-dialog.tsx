@@ -42,14 +42,24 @@ interface VerificationResult {
 
 async function sha256Hex(value: string): Promise<string> {
   const encoded = new TextEncoder().encode(value)
-  const digest = await crypto.subtle.digest('SHA-256', encoded)
-  const bytes = new Uint8Array(digest)
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+  // crypto.subtle 仅在 HTTPS 或 localhost 下可用，HTTP 环境回退到简单哈希
+  if (globalThis.crypto?.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', encoded)
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
+  }
+  // 回退：FNV-1a 风格的简单哈希（仅用于重复检测，非安全用途）
+  let h = 0x811c9dc5
+  for (const b of encoded) {
+    h ^= b
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0') + value.length.toString(16).padStart(8, '0')
 }
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
+  const [skipVerify, setSkipVerify] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
@@ -186,27 +196,44 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           addedCredId = addedCred.credentialId
 
-          // 延迟 1 秒
-          await new Promise(resolve => setTimeout(resolve, 1000))
+          if (skipVerify) {
+            // 跳过验活，直接标记成功
+            successCount++
+            existingTokenHashes.add(tokenHash)
+            setCurrentProcessing(addedCred.email ? `导入成功: ${addedCred.email}` : `导入成功: 凭据 ${i + 1}`)
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'verified',
+                email: addedCred.email || undefined,
+                credentialId: addedCred.credentialId
+              }
+              return newResults
+            })
+          } else {
+            // 延迟 1 秒
+            await new Promise(resolve => setTimeout(resolve, 1000))
 
-          // 验活
-          const balance = await getCredentialBalance(addedCred.credentialId)
+            // 验活
+            const balance = await getCredentialBalance(addedCred.credentialId)
 
-          // 验活成功
-          successCount++
-          existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
-          setResults(prev => {
-            const newResults = [...prev]
-            newResults[i] = {
-              ...newResults[i],
-              status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || undefined,
-              credentialId: addedCred.credentialId
-            }
-            return newResults
-          })
+            // 验活成功
+            successCount++
+            existingTokenHashes.add(tokenHash)
+            setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'verified',
+                usage: `${balance.currentUsage}/${balance.usageLimit}`,
+                email: addedCred.email || undefined,
+                credentialId: addedCred.credentialId
+              }
+              return newResults
+            })
+          }
         } catch (error) {
           // 验活失败，尝试回滚（先禁用再删除）
           let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
@@ -312,7 +339,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>批量导入凭据（自动验活）</DialogTitle>
+          <DialogTitle>批量导入凭据{skipVerify ? '' : '（自动验活）'}</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
@@ -330,6 +357,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <p className="text-xs text-muted-foreground">
               💡 导入时自动验活，失败的凭据会被排除
             </p>
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={skipVerify}
+                onChange={(e) => setSkipVerify(e.target.checked)}
+                disabled={importing}
+                className="rounded"
+              />
+              跳过验活（直接导入，不检查凭据有效性）
+            </label>
           </div>
 
           {(importing || results.length > 0) && (
@@ -423,7 +460,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               onClick={handleBatchImport}
               disabled={importing || !jsonInput.trim()}
             >
-              开始导入并验活
+              {skipVerify ? '开始导入' : '开始导入并验活'}
             </Button>
           )}
         </DialogFooter>
