@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
+import copy
 from typing import Any, Dict, List, Optional
 
 from fastapi import Request
@@ -340,8 +341,8 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
         )
         return await websearch.handle_websearch_request(provider, payload, input_tokens)
 
-    # 非纯搜索请求时，剥离 web_search 工具（Kiro 不支持）
-    websearch.strip_web_search_tools(payload)
+    # web_search 始终注入到工具列表，所有流式请求走 auto-continue
+    has_ws = True
 
     try:
         result = convert_request(payload)
@@ -366,6 +367,12 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
     thinking_enabled = thinking.is_enabled() if thinking else False
 
     if payload.stream:
+        # 有 web_search 时统一走 buffered auto-continue（不论端点）
+        if has_ws:
+            return await _handle_buffered_auto_continue(
+                provider, state, payload, request_body, payload.model,
+                input_tokens, thinking_enabled,
+            )
         if use_buffered:
             return await _handle_stream_request_buffered(provider, request_body, payload.model, input_tokens, thinking_enabled)
         return await _handle_stream_request(provider, request_body, payload.model, input_tokens, thinking_enabled)
@@ -384,6 +391,281 @@ async def post_messages_cc(request: Request, payload: MessagesRequest):
                 payload.model, payload.stream, len(payload.messages))
     state: AppState = request.state.app_state
     return await _process_messages_common(state, payload, use_buffered=True)
+
+
+async def _buffer_kiro_stream(provider, request_body: str, model: str, input_tokens: int, thinking_enabled: bool) -> BufferedStreamContext:
+    """调用 Kiro 并缓冲完整响应"""
+    from kiro.parser.decoder import EventStreamDecoder
+
+    response = await provider.call_api_stream(request_body)
+    buf_ctx = BufferedStreamContext(model, input_tokens, thinking_enabled)
+    decoder = EventStreamDecoder()
+
+    async for chunk in response.aiter_bytes():
+        decoder.feed(chunk)
+        for frame in decoder.decode_all():
+            event = _parse_event(frame)
+            if event is not None:
+                buf_ctx.process_and_buffer(event)
+
+    return buf_ctx
+
+
+def _build_continuation_messages(
+    original_messages: List[Dict[str, Any]],
+    accumulated_text: str,
+    ws_tool_uses: List[Dict[str, Any]],
+    search_results_map: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """构建续接消息：原消息 + assistant(text+tool_use) + user(tool_result)"""
+    messages = copy.deepcopy(original_messages)
+
+    # assistant 消息：文本 + tool_use
+    assistant_content: List[Dict[str, Any]] = []
+    if accumulated_text:
+        assistant_content.append({"type": "text", "text": accumulated_text})
+    for ws in ws_tool_uses:
+        try:
+            inp = json.loads(ws["input_json"]) if ws["input_json"] else {}
+        except json.JSONDecodeError:
+            inp = {}
+        assistant_content.append({
+            "type": "tool_use", "id": ws["tool_use_id"],
+            "name": ws["name"], "input": inp,
+        })
+    messages.append({"role": "assistant", "content": assistant_content})
+
+    # user 消息：tool_result
+    user_content: List[Dict[str, Any]] = []
+    for ws in ws_tool_uses:
+        result_text = search_results_map.get(ws["tool_use_id"], "No results found.")
+        user_content.append({
+            "type": "tool_result", "tool_use_id": ws["tool_use_id"],
+            "content": result_text,
+        })
+    messages.append({"role": "user", "content": user_content})
+
+    return messages
+
+
+def _merge_auto_continue_events(
+    first_events: List[SseEvent],
+    ws_tool_uses: List[Dict[str, Any]],
+    search_results_map: Dict[str, "websearch.WebSearchResults"],
+    second_events: List[SseEvent],
+) -> List[SseEvent]:
+    """合并两次响应的 SSE 事件为一个流
+
+    第一次响应中的 tool_use(web_search) → 替换为 server_tool_use + web_search_tool_result
+    第二次响应中的 content 块 → 重新编号 index 后追加
+    """
+    merged: List[SseEvent] = []
+    ws_ids = {ws["tool_use_id"] for ws in ws_tool_uses}
+    skip_tool_use_indices = set()  # 需要跳过的 tool_use block index
+    max_index = -1
+
+    # 第一遍：找出 web_search tool_use 的 block index
+    for evt in first_events:
+        if evt.event == "content_block_start":
+            cb = evt.data.get("content_block", {})
+            if cb.get("type") == "tool_use" and cb.get("id") in ws_ids:
+                skip_tool_use_indices.add(evt.data.get("index"))
+
+    # 第二遍：复制第一次响应事件，跳过 web_search tool_use 块和 message_delta/message_stop
+    for evt in first_events:
+        idx = evt.data.get("index")
+        if idx in skip_tool_use_indices:
+            continue
+        if evt.event in ("message_delta", "message_stop"):
+            continue
+        merged.append(evt)
+        if idx is not None and idx > max_index:
+            max_index = idx
+
+    # 插入 server_tool_use + web_search_tool_result 事件
+    next_index = max_index + 1
+    for ws in ws_tool_uses:
+        try:
+            query = json.loads(ws["input_json"]).get("query", "") if ws["input_json"] else ""
+        except json.JSONDecodeError:
+            query = ""
+        results = search_results_map.get(ws["tool_use_id"])
+        ws_events = websearch.generate_web_search_result_events(
+            ws["tool_use_id"], query, results, next_index,
+        )
+        merged.extend(ws_events)
+        next_index += 2  # server_tool_use + web_search_tool_result 各占一个 index
+
+    # 追加第二次响应的 content 块（重新编号）
+    second_index_offset = next_index
+    second_min_index = None
+    for evt in second_events:
+        if evt.event == "message_start":
+            continue  # 跳过第二次的 message_start
+        idx = evt.data.get("index")
+        if idx is not None:
+            if second_min_index is None:
+                second_min_index = idx
+            evt.data["index"] = idx - (second_min_index or 0) + second_index_offset
+        if evt.event in ("content_block_start",):
+            cb = evt.data.get("content_block", {})
+            if "index" in cb:
+                cb["index"] = evt.data["index"]
+        merged.append(evt)
+
+    return merged
+
+
+MAX_AUTO_CONTINUE_ROUNDS = 5  # web_search 最大续接轮数
+
+
+async def _do_mcp_searches(provider, ws_tool_uses: List[Dict[str, Any]]):
+    """对所有 web_search tool_use 执行 MCP 搜索，返回 (results_map, text_map)"""
+    search_results_map: Dict[str, Any] = {}
+    search_text_map: Dict[str, str] = {}
+    for ws in ws_tool_uses:
+        try:
+            query = json.loads(ws["input_json"]).get("query", "") if ws["input_json"] else ""
+        except json.JSONDecodeError:
+            query = ""
+        if query:
+            results = await websearch.call_mcp_search(provider, query)
+            search_results_map[ws["tool_use_id"]] = results
+            search_text_map[ws["tool_use_id"]] = websearch.format_search_results_text(query, results)
+        else:
+            search_results_map[ws["tool_use_id"]] = None
+            search_text_map[ws["tool_use_id"]] = "No query provided."
+    return search_results_map, search_text_map
+
+
+async def _handle_buffered_auto_continue(
+    provider, state, payload: MessagesRequest, request_body: str,
+    model: str, input_tokens: int, thinking_enabled: bool,
+):
+    """缓冲流 + web_search 自动续接（支持多轮）"""
+    msg_logger = get_message_logger()
+
+    try:
+        buf_ctx = await _buffer_kiro_stream(provider, request_body, model, input_tokens, thinking_enabled)
+    except Exception as e:
+        return _map_provider_error(e)
+
+    ws_tool_uses = buf_ctx.get_web_search_tool_uses()
+
+    # 没有 web_search tool_use → 正常返回
+    if not ws_tool_uses:
+        first_events = buf_ctx.finish_and_get_all_events()
+
+        async def normal_gen():
+            for sse in first_events:
+                yield sse.to_sse_string()
+        return StreamingResponse(normal_gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+    # 收集所有轮次的事件和搜索结果，用于最终合并
+    all_rounds: List[dict] = []  # [{events, ws_tool_uses, search_results_map}]
+    current_messages = payload.messages
+    prev_buf = buf_ctx
+
+    for round_idx in range(MAX_AUTO_CONTINUE_ROUNDS):
+        cur_ws = prev_buf.get_web_search_tool_uses()
+        if not cur_ws:
+            break
+
+        logger.info("auto-continue 第 %d 轮: 检测到 %d 个 web_search", round_idx + 1, len(cur_ws))
+
+        # MCP 搜索
+        search_results_map, search_text_map = await _do_mcp_searches(provider, cur_ws)
+
+        # 记录本轮
+        cur_events = prev_buf.finish_and_get_all_events()
+        all_rounds.append({
+            "events": cur_events,
+            "ws_tool_uses": cur_ws,
+            "search_results_map": search_results_map,
+        })
+
+        # 构建续接消息
+        continuation_messages = _build_continuation_messages(
+            current_messages, prev_buf.inner.accumulated_text,
+            cur_ws, search_text_map,
+        )
+        continuation_payload = copy.deepcopy(payload)
+        continuation_payload.messages = continuation_messages
+
+        try:
+            cont_result = convert_request(continuation_payload)
+        except Exception as e:
+            logger.error("续接请求转换失败 (第 %d 轮): %s", round_idx + 1, e)
+            break
+
+        cont_kiro_req = {"conversationState": cont_result.conversation_state.to_dict()}
+        if state.profile_arn:
+            cont_kiro_req["profileArn"] = state.profile_arn
+        cont_body = json.dumps(cont_kiro_req, ensure_ascii=False)
+
+        # 记录续接请求日志
+        if msg_logger and msg_logger.enabled:
+            msg_logger.log_request(
+                model=model, messages=continuation_messages,
+                system=payload.system, tools=payload.tools,
+                stream=True,
+            )
+
+        try:
+            prev_buf = await _buffer_kiro_stream(provider, cont_body, model, input_tokens, thinking_enabled)
+        except Exception as e:
+            logger.error("续接 Kiro 调用失败 (第 %d 轮): %s", round_idx + 1, e)
+            break
+
+        current_messages = continuation_messages
+
+    # 最后一轮的事件（最终回答或最后一次 tool_use）
+    final_events = prev_buf.finish_and_get_all_events()
+
+    # 合并所有轮次
+    if not all_rounds:
+        # 没有任何续接（不应该到这里，但保险起见）
+        merged = final_events
+    else:
+        # 逐轮合并：第一轮 events + search results + 第二轮 events + ... + final
+        merged = _merge_multi_round_events(all_rounds, final_events)
+
+    # 日志
+    if msg_logger and msg_logger.enabled:
+        msg_logger.log_stream_text(
+            model=model, text=prev_buf.inner.accumulated_text,
+            stop_reason=prev_buf.inner.state_manager.get_stop_reason(),
+            usage={"input_tokens": input_tokens, "output_tokens": prev_buf.inner.output_tokens},
+        )
+
+    async def merged_gen():
+        for sse in merged:
+            yield sse.to_sse_string()
+
+    return StreamingResponse(merged_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
+def _merge_multi_round_events(
+    rounds: List[dict], final_events: List[SseEvent],
+) -> List[SseEvent]:
+    """合并多轮 auto-continue 事件为一个 SSE 流"""
+    if len(rounds) == 1:
+        return _merge_auto_continue_events(
+            rounds[0]["events"], rounds[0]["ws_tool_uses"],
+            rounds[0]["search_results_map"], final_events,
+        )
+
+    # 多轮：逐轮合并，每轮的 "下一轮事件" 是后续所有轮的递归合并
+    # 简化实现：从最后一轮往前合并
+    result_events = final_events
+    for rnd in reversed(rounds):
+        result_events = _merge_auto_continue_events(
+            rnd["events"], rnd["ws_tool_uses"],
+            rnd["search_results_map"], result_events,
+        )
+    return result_events
 
 
 async def count_tokens(payload: CountTokensRequest):

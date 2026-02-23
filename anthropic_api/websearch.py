@@ -304,6 +304,12 @@ async def handle_websearch_request(provider, payload: MessagesRequest, input_tok
     except Exception as e:
         logger.warning("MCP API 调用失败: %s", e)
 
+    # 非流式：返回 JSON
+    if not payload.stream:
+        return _build_websearch_json_response(
+            payload.model, query, tool_use_id, search_results, input_tokens,
+        )
+
     events = _generate_websearch_events(payload.model, query, tool_use_id, search_results, input_tokens)
 
     async def event_generator():
@@ -315,3 +321,94 @@ async def handle_websearch_request(provider, payload: MessagesRequest, input_tok
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+def _build_websearch_json_response(
+    model: str, query: str, tool_use_id: str,
+    search_results: Optional[WebSearchResults], input_tokens: int,
+):
+    """构建非流式 JSON 响应（Anthropic Messages API 格式）"""
+    from fastapi.responses import JSONResponse
+
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    summary = _generate_search_summary(query, search_results)
+    output_tokens = (len(summary) + 3) // 4
+
+    search_content = []
+    if search_results:
+        search_content = [{"type": "web_search_result", "title": r.title, "url": r.url,
+                           "encrypted_content": r.snippet or "", "page_age": None}
+                          for r in search_results.results]
+
+    content = [
+        {"id": tool_use_id, "type": "server_tool_use", "name": "web_search",
+         "input": {"query": query}},
+        {"type": "web_search_tool_result", "tool_use_id": tool_use_id,
+         "content": search_content},
+        {"type": "text", "text": summary},
+    ]
+
+    return JSONResponse(content={
+        "id": message_id, "type": "message", "role": "assistant",
+        "model": model, "content": content,
+        "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+    })
+
+
+async def call_mcp_search(provider, query: str) -> Optional[WebSearchResults]:
+    """调用 Kiro MCP 执行搜索，返回解析后的结果"""
+    _, mcp_request = create_mcp_request(query)
+    try:
+        resp = await provider.call_mcp(json.dumps(mcp_request.to_dict()))
+        body = await resp.aread()
+        mcp_resp = McpResponse.from_dict(json.loads(body))
+        if mcp_resp.error:
+            logger.warning("MCP search error: %s", mcp_resp.error.message)
+            return None
+        return parse_search_results(mcp_resp)
+    except Exception as e:
+        logger.warning("MCP search 调用失败: %s", e)
+        return None
+
+
+def format_search_results_text(query: str, results: Optional[WebSearchResults]) -> str:
+    """格式化搜索结果为 tool_result 文本"""
+    return _generate_search_summary(query, results)
+
+
+def generate_web_search_result_events(
+    tool_use_id: str, query: str, search_results: Optional[WebSearchResults],
+    start_index: int,
+) -> List[SseEvent]:
+    """生成 server_tool_use + web_search_tool_result 的 SSE 事件块"""
+    events: List[SseEvent] = []
+
+    # server_tool_use 块
+    events.append(SseEvent("content_block_start", {
+        "type": "content_block_start", "index": start_index,
+        "content_block": {
+            "id": tool_use_id, "type": "server_tool_use",
+            "name": "web_search", "input": {},
+        },
+    }))
+    events.append(SseEvent("content_block_delta", {
+        "type": "content_block_delta", "index": start_index,
+        "delta": {"type": "input_json_delta", "partial_json": json.dumps({"query": query}, ensure_ascii=False)},
+    }))
+    events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": start_index}))
+
+    # web_search_tool_result 块
+    search_content = []
+    if search_results:
+        search_content = [{"type": "web_search_result", "title": r.title, "url": r.url,
+                           "encrypted_content": r.snippet or "", "page_age": None}
+                          for r in search_results.results]
+    events.append(SseEvent("content_block_start", {
+        "type": "content_block_start", "index": start_index + 1,
+        "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": search_content},
+    }))
+    events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": start_index + 1}))
+
+    return events

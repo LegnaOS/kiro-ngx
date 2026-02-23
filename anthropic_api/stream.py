@@ -220,6 +220,8 @@ class StreamContext:
         self.text_block_index: Optional[int] = None
         self._strip_thinking_leading_newline = False
         self.accumulated_text = ""  # 累积文本，用于日志记录
+        self.web_search_tool_uses: List[Dict[str, Any]] = []  # 记录 web_search tool_use
+        self._tool_json_buffers: Dict[str, str] = {}  # tool_use_id → 累积的 JSON 字符串
 
     def create_message_start_event(self) -> dict:
         return {
@@ -433,6 +435,10 @@ class StreamContext:
         # 参数增量
         if tool_use.input:
             self.output_tokens += (len(tool_use.input) + 3) // 4
+            # 累积 tool_use 的 JSON 输入
+            buf = self._tool_json_buffers.get(tool_use.tool_use_id, "")
+            buf += tool_use.input
+            self._tool_json_buffers[tool_use.tool_use_id] = buf
             delta = self.state_manager.handle_content_block_delta(block_index, {
                 "type": "content_block_delta", "index": block_index,
                 "delta": {"type": "input_json_delta", "partial_json": tool_use.input},
@@ -445,6 +451,14 @@ class StreamContext:
             stop = self.state_manager.handle_content_block_stop(block_index)
             if stop:
                 events.append(stop)
+            # 记录 web_search tool_use
+            if tool_use.name == "web_search":
+                input_json = self._tool_json_buffers.get(tool_use.tool_use_id, "")
+                self.web_search_tool_uses.append({
+                    "tool_use_id": tool_use.tool_use_id,
+                    "name": tool_use.name,
+                    "input_json": input_json,
+                })
 
         return events
 
@@ -510,6 +524,10 @@ class BufferedStreamContext:
             self.event_buffer.extend(self.inner.generate_initial_events())
             self._initial_events_generated = True
         self.event_buffer.extend(self.inner.process_kiro_event(event))
+
+    def get_web_search_tool_uses(self) -> List[Dict[str, Any]]:
+        """获取响应中的 web_search tool_use 列表"""
+        return self.inner.web_search_tool_uses
 
     def finish_and_get_all_events(self) -> List[SseEvent]:
         if not self._initial_events_generated:

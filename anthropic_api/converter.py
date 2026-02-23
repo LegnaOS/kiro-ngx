@@ -155,18 +155,41 @@ def _process_message_content(content: Any) -> Tuple[str, List[KiroImage], List[T
     return "\n".join(text_parts), images, tool_results
 
 
+def _make_web_search_tool() -> Tool:
+    """将 web_search 转为普通 Kiro 工具定义"""
+    return Tool(
+        tool_specification=ToolSpecification(
+            name="web_search",
+            description="Search the web for current information. Use this when you need up-to-date information that may not be in your training data.",
+            input_schema=InputSchema.from_json({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "The search query"}},
+                "required": ["query"],
+            }),
+        )
+    )
+
+
 def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
-    """转换工具定义（跳过 server-side tool 如 web_search）"""
-    if not tools:
-        return []
+    """转换工具定义，始终注入 web_search 工具"""
     result = []
-    for t in tools:
-        # 跳过 server-side tool（type 以 web_search 开头、无 input_schema）
+    has_web_search = False
+    for t in (tools or []):
+        # 客户端显式发送的 web_search 类型工具
         tool_type = t.get("type", "")
         if tool_type and tool_type.startswith("web_search"):
+            if not has_web_search:
+                result.append(_make_web_search_tool())
+                has_web_search = True
             continue
         desc = t.get("description", "")
         name = t.get("name", "")
+        if name == "web_search":
+            # 客户端以普通工具形式发送的 web_search，跳过（后面统一注入）
+            has_web_search = True
+            result.append(_make_web_search_tool())
+            continue
         suffix = ""
         if name == "Write":
             suffix = WRITE_TOOL_DESCRIPTION_SUFFIX
@@ -183,6 +206,9 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
                 input_schema=InputSchema.from_json(schema),
             )
         ))
+    # 无论客户端是否发送，始终确保 web_search 可用
+    if not has_web_search:
+        result.append(_make_web_search_tool())
     return result
 
 
