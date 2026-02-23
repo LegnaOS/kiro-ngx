@@ -294,22 +294,28 @@ async def get_system_stats(request: Request) -> JSONResponse:
     })
 
 
-def _git_commit_info(ref: str = "HEAD") -> dict:
-    """获取指定 ref 的 commit 短哈希和摘要"""
+def _read_version(source: str = "local") -> str:
+    """读取版本号，local 读本地文件，remote 读远程 VERSION"""
     import subprocess
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
-    try:
-        r = subprocess.run(
-            ["git", "log", "-1", "--format=%h|%s|%ci", ref],
-            cwd=str(root), capture_output=True, text=True, timeout=10,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            parts = r.stdout.strip().split("|", 2)
-            return {"hash": parts[0], "message": parts[1] if len(parts) > 1 else "", "date": parts[2] if len(parts) > 2 else ""}
-    except Exception:
-        pass
-    return {"hash": "unknown", "message": "", "date": ""}
+
+    if source == "local":
+        try:
+            return (root / "VERSION").read_text(encoding="utf-8").strip()
+        except Exception:
+            return "unknown"
+    else:
+        try:
+            r = subprocess.run(
+                ["git", "show", "origin/master:VERSION"],
+                cwd=str(root), capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return "unknown"
 
 
 async def get_version_info(request: Request) -> JSONResponse:
@@ -322,10 +328,9 @@ async def get_version_info(request: Request) -> JSONResponse:
     loop = asyncio.get_event_loop()
 
     def _fetch():
-        # 获取本地当前版本
-        local = _git_commit_info("HEAD")
+        current = _read_version("local")
 
-        # fetch 远程最新
+        # fetch 远程
         try:
             subprocess.run(
                 ["git", "fetch", "origin", "--quiet"],
@@ -334,14 +339,12 @@ async def get_version_info(request: Request) -> JSONResponse:
         except Exception:
             pass
 
-        remote = _git_commit_info("origin/master")
-
-        # 检查是否有更新：本地 hash != 远程 hash
-        has_update = local["hash"] != "unknown" and remote["hash"] != "unknown" and local["hash"] != remote["hash"]
+        latest = _read_version("remote")
+        has_update = current != "unknown" and latest != "unknown" and current != latest
 
         return {
-            "current": local,
-            "latest": remote,
+            "current": current,
+            "latest": latest,
             "hasUpdate": has_update,
         }
 

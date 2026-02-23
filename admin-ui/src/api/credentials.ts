@@ -117,8 +117,8 @@ export async function getSystemStats(): Promise<{ cpuPercent: number; memoryMb: 
 
 // 版本信息
 export interface VersionInfo {
-  current: { hash: string; message: string; date: string }
-  latest: { hash: string; message: string; date: string }
+  current: string
+  latest: string
   hasUpdate: boolean
 }
 

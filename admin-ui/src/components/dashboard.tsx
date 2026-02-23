@@ -549,7 +549,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
             {versionInfo && (
               <span className="text-xs text-muted-foreground ml-1">
-                {versionInfo.current.hash}
+                v{versionInfo.current}
               </span>
             )}
             {versionInfo?.hasUpdate && (
@@ -558,7 +558,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950"
                 onClick={handleUpdate}
               >
-                新版本: {versionInfo.latest.hash}
+                v{versionInfo.latest} 可用
               </Badge>
             )}
           </div>
@@ -575,7 +575,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleUpdate} disabled={updating || restarting} title={versionInfo?.hasUpdate ? `更新到 ${versionInfo.latest.hash}: ${versionInfo.latest.message}` : '拉取更新并重启'}>
+            <Button variant="ghost" size="icon" onClick={handleUpdate} disabled={updating || restarting} title={versionInfo?.hasUpdate ? `更新到 v${versionInfo.latest}` : '检查更新'}>
               <Download className={`h-5 w-5 ${updating ? 'animate-bounce' : versionInfo?.hasUpdate ? 'text-orange-500' : ''}`} />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleRestart} disabled={restarting || updating} title="重启服务">
