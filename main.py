@@ -23,6 +23,7 @@ from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middlewa
 from admin import AdminService, AdminAuthMiddleware, create_admin_router
 from admin.ui_router import create_admin_ui_router
 from anthropic_api.message_log import init_message_logger
+from token_usage import init_token_usage_tracker
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -89,6 +90,9 @@ def main():
     # 初始化消息日志
     log_dir = Path(__file__).resolve().parent / "logs"
     init_message_logger(log_dir)
+
+    # 初始化 token 用量追踪
+    init_token_usage_tracker(token_manager.cache_dir())
 
     # 构建 FastAPI 应用
     app = FastAPI()

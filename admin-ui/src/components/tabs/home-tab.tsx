@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Activity, Zap, TrendingUp, Hash, Server, Cpu, HardDrive } from 'lucide-react'
+import { Activity, Zap, TrendingUp, Hash, Server, Cpu, HardDrive, ArrowUpRight, ArrowDownRight } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { getRequestStats, getSystemStats } from '@/api/credentials'
 import type { RequestStats } from '@/types/api'
@@ -37,6 +37,8 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
     ? Object.entries(stats.modelCounts).sort((a, b) => b[1] - a[1])
     : []
 
+  const tokenUsage = stats?.tokenUsage
+
   return (
     <div className="space-y-6">
       <div className="grid gap-4 md:grid-cols-4">
@@ -48,6 +50,18 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
       <div className="grid gap-4 md:grid-cols-4">
         <StatCard icon={<Server className="h-4 w-4" />} label="凭据总数" value={credentialCount} />
         <StatCard icon={<Server className="h-4 w-4" />} label="可用凭据" value={availableCount} color="text-green-600" />
+        <TokenStatCard
+          label="今日输入 Tokens"
+          value={tokenUsage?.today.input ?? 0}
+          yesterday={tokenUsage?.yesterday.input ?? 0}
+        />
+        <TokenStatCard
+          label="今日输出 Tokens"
+          value={tokenUsage?.today.output ?? 0}
+          yesterday={tokenUsage?.yesterday.output ?? 0}
+        />
+      </div>
+      <div className="grid gap-4 md:grid-cols-2">
         <StatCard icon={<Cpu className="h-4 w-4" />} label="CPU 使用率" value={sysStats ? `${sysStats.cpuPercent}%` : '-'} />
         <StatCard icon={<HardDrive className="h-4 w-4" />} label="进程内存" value={sysStats ? `${sysStats.memoryMb} MB` : '-'} />
       </div>
@@ -67,9 +81,14 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
                 const segments = Object.entries(credBreakdown)
                   .map(([cid, cnt]) => ({ credId: Number(cid), count: cnt }))
                   .sort((a, b) => b.count - a.count)
+                const modelTokens = tokenUsage?.models?.[model]
 
                 return (
-                  <ModelBar key={model} model={model} total={count} pct={pct} segments={segments} />
+                  <ModelBar
+                    key={model} model={model} total={count} pct={pct} segments={segments}
+                    inputTokens={modelTokens?.today.input ?? 0}
+                    outputTokens={modelTokens?.today.output ?? 0}
+                  />
                 )
               })}
             </div>
@@ -80,9 +99,10 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
   )
 }
 
-function ModelBar({ model, total, pct, segments }: {
+function ModelBar({ model, total, pct, segments, inputTokens, outputTokens }: {
   model: string; total: number; pct: number
   segments: { credId: number; count: number }[]
+  inputTokens: number; outputTokens: number
 }) {
   const [hovered, setHovered] = useState(false)
 
@@ -134,6 +154,9 @@ function ModelBar({ model, total, pct, segments }: {
         )}
       </div>
       <span className="text-sm font-medium w-12 text-right">{total}</span>
+      <span className="text-xs text-muted-foreground w-36 text-right font-mono" title={`输入: ${inputTokens.toLocaleString()} / 输出: ${outputTokens.toLocaleString()}`}>
+        {formatTokenCount(inputTokens)} / {formatTokenCount(outputTokens)}
+      </span>
     </div>
   )
 }
@@ -149,6 +172,38 @@ function StatCard({ icon, label, value, color }: {
       </CardHeader>
       <CardContent>
         <div className={`text-2xl font-bold ${color || ''}`}>{value}</div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+function TokenStatCard({ label, value, yesterday }: {
+  label: string; value: number; yesterday: number
+}) {
+  const pctChange = yesterday > 0 ? ((value - yesterday) / yesterday) * 100 : 0
+  const showChange = yesterday > 0
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between pb-2">
+        <CardTitle className="text-sm font-medium text-muted-foreground">{label}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="text-2xl font-bold">{formatTokenCount(value)}</div>
+        {showChange && (
+          <div className={`flex items-center gap-1 text-xs mt-1 ${pctChange >= 0 ? 'text-orange-500' : 'text-green-500'}`}>
+            {pctChange >= 0
+              ? <ArrowUpRight className="h-3 w-3" />
+              : <ArrowDownRight className="h-3 w-3" />}
+            <span>{Math.abs(pctChange).toFixed(0)}% vs 昨日</span>
+          </div>
+        )}
       </CardContent>
     </Card>
   )

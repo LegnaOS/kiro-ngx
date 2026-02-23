@@ -20,6 +20,7 @@ from .types import (
 )
 from . import websearch
 from .message_log import get_message_logger
+from token_usage import get_token_usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,13 @@ def _map_provider_error(err: Exception):
     return JSONResponse(status_code=502, content=ErrorResponse.new(
         "api_error", f"上游 API 调用失败: {err}",
     ).to_dict())
+
+
+def _report_token_usage(model: str, input_tokens: int, output_tokens: int):
+    """向 TokenUsageTracker 上报一次请求的 token 用量"""
+    tracker = get_token_usage_tracker()
+    if tracker:
+        tracker.report(model, input_tokens, output_tokens)
 
 
 # === 模型列表 ===
@@ -139,6 +147,9 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
                 usage={"input_tokens": final_input, "output_tokens": ctx.output_tokens},
             )
 
+        # 上报 token 用量
+        _report_token_usage(model, ctx.context_input_tokens or input_tokens, ctx.output_tokens)
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -192,6 +203,10 @@ async def _handle_stream_request_buffered(provider, request_body: str, model: st
                 stop_reason=inner.state_manager.get_stop_reason(),
                 usage={"input_tokens": final_input, "output_tokens": inner.output_tokens},
             )
+
+        # 上报 token 用量
+        inner = buf_ctx.inner
+        _report_token_usage(model, inner.context_input_tokens or estimated_input_tokens, inner.output_tokens)
 
     return StreamingResponse(
         event_generator(),
@@ -303,6 +318,9 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
             stop_reason=stop_reason,
             usage={"input_tokens": final_input, "output_tokens": output_tokens},
         )
+
+    # 上报 token 用量
+    _report_token_usage(model, final_input, output_tokens)
 
     return JSONResponse(content={
         "id": f"msg_{uuid.uuid4().hex}", "type": "message", "role": "assistant",
@@ -559,6 +577,8 @@ async def _handle_stream_auto_continue(
                         stop_reason=ctx.state_manager.get_stop_reason(),
                         usage={"input_tokens": input_tokens, "output_tokens": ctx.output_tokens},
                     )
+                # 上报 token 用量
+                _report_token_usage(model, ctx.context_input_tokens or input_tokens, ctx.output_tokens)
                 return
 
             # === 检测到 web_search，执行搜索并续接 ===

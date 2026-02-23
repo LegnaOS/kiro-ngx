@@ -346,7 +346,18 @@ class AdminService:
         self._save_routing()
 
     def get_stats(self) -> dict:
-        return self.token_manager.get_stats()
+        from token_usage import get_token_usage_tracker
+        stats = self.token_manager.get_stats()
+        tracker = get_token_usage_tracker()
+        if tracker:
+            stats["tokenUsage"] = tracker.get_stats()
+        else:
+            stats["tokenUsage"] = {
+                "today": {"input": 0, "output": 0},
+                "yesterday": {"input": 0, "output": 0},
+                "models": {},
+            }
+        return stats
 
     # ============ 错误分类 ============
 

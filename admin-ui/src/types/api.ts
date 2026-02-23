@@ -84,6 +84,18 @@ export interface AddCredentialResponse {
   email?: string
 }
 
+// Token 用量
+export interface TokenPair {
+  input: number
+  output: number
+}
+
+export interface TokenUsage {
+  today: TokenPair
+  yesterday: TokenPair
+  models: Record<string, { today: TokenPair; yesterday: TokenPair }>
+}
+
 // 统计数据
 export interface RequestStats {
   totalRequests: number
@@ -94,6 +106,7 @@ export interface RequestStats {
   modelCredCounts: Record<string, Record<string, number>>  // {model: {credId: count}}
   credentialCount: number
   availableCount: number
+  tokenUsage: TokenUsage
 }
 
 // 模型信息
