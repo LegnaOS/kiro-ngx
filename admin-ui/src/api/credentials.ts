@@ -135,3 +135,25 @@ export async function restartServer(): Promise<{ success: boolean; message: stri
   }
   return { success: false, message: '服务重启超时，请手动检查' }
 }
+
+// 拉取更新并重启（git pull + build + restart）
+export async function updateAndRestart(): Promise<{ success: boolean; message: string }> {
+  try {
+    await api.post('/update')
+  } catch {
+    // 更新重启导致连接断开是正常的
+  }
+  // 更新+构建+重启需要更长时间
+  const maxAttempts = 120
+  const interval = 2000
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, interval))
+    try {
+      await api.get('/credentials')
+      return { success: true, message: '更新并重启成功' }
+    } catch {
+      // 服务尚未恢复
+    }
+  }
+  return { success: false, message: '更新重启超时，请手动检查' }
+}

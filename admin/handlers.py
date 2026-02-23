@@ -310,3 +310,73 @@ async def restart_server(request: Request) -> JSONResponse:
 
     asyncio.ensure_future(_do_restart())
     return JSONResponse(content={"success": True, "message": "正在重启..."})
+
+
+async def update_and_restart(request: Request) -> JSONResponse:
+    """POST /update - 拉取最新代码、构建前端、重启服务"""
+    import asyncio
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parent.parent
+
+    # 同步执行 git pull + npm build，收集输出
+    async def _do_update():
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            steps_log = []
+
+            # git pull
+            r = subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=str(project_root), capture_output=True, text=True, timeout=60,
+            )
+            steps_log.append(f"[git pull] rc={r.returncode}\n{r.stdout}{r.stderr}")
+            if r.returncode != 0:
+                return False, "\n".join(steps_log)
+
+            # npm install + build
+            admin_ui = project_root / "admin-ui"
+            if (admin_ui / "package.json").exists():
+                r = subprocess.run(
+                    ["npm", "install", "--silent"],
+                    cwd=str(admin_ui), capture_output=True, text=True, timeout=120,
+                )
+                steps_log.append(f"[npm install] rc={r.returncode}\n{r.stdout}{r.stderr}")
+
+                r = subprocess.run(
+                    ["npm", "run", "build"],
+                    cwd=str(admin_ui), capture_output=True, text=True, timeout=120,
+                )
+                steps_log.append(f"[npm build] rc={r.returncode}\n{r.stdout}{r.stderr}")
+                if r.returncode != 0:
+                    return False, "\n".join(steps_log)
+
+            # pip install
+            venv_pip = project_root / "venv" / "bin" / "pip"
+            if venv_pip.exists():
+                r = subprocess.run(
+                    [str(venv_pip), "install", "-q", "-r", "requirements.txt"],
+                    cwd=str(project_root), capture_output=True, text=True, timeout=60,
+                )
+                steps_log.append(f"[pip install] rc={r.returncode}\n{r.stdout}{r.stderr}")
+
+            return True, "\n".join(steps_log)
+
+        success, log = await loop.run_in_executor(None, _run)
+        if not success:
+            logger.error("更新失败:\n%s", log)
+            return
+
+        logger.info("更新完成，正在重启...\n%s", log)
+        await asyncio.sleep(0.5)
+        if platform.system() == "Windows":
+            subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+            os._exit(0)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    asyncio.ensure_future(_do_update())
+    return JSONResponse(content={"success": True, "message": "正在更新并重启..."})

@@ -7,6 +7,7 @@ from admin.handlers import (
     get_credential_balance, get_load_balancing_mode, get_raw_credentials,
     get_system_stats, reset_failure_count, restart_server, save_raw_credentials,
     set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+    update_and_restart,
 )
 
 
@@ -39,4 +40,5 @@ def create_admin_router() -> APIRouter:
     router.add_api_route("/config/load-balancing", set_load_balancing_mode, methods=["PUT"])
     router.add_api_route("/system/stats", get_system_stats, methods=["GET"])
     router.add_api_route("/restart", restart_server, methods=["POST"])
+    router.add_api_route("/update", update_and_restart, methods=["POST"])
     return router

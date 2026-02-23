@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Power } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Power, Download } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -13,7 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { CredentialsEditorDialog } from '@/components/credentials-editor-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, getSystemStats, restartServer } from '@/api/credentials'
+import { getCredentialBalance, getSystemStats, restartServer, updateAndRestart } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -56,6 +56,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   // 系统监控
   const [systemStats, setSystemStats] = useState<{ cpuPercent: number; memoryMb: number } | null>(null)
   const [restarting, setRestarting] = useState(false)
+  const [updating, setUpdating] = useState(false)
 
   useEffect(() => {
     const fetchStats = () => {
@@ -139,6 +140,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
     if (result.success) {
       toast.success(result.message)
       refetch()
+    } else {
+      toast.error(result.message)
+    }
+  }
+
+  const handleUpdate = async () => {
+    setUpdating(true)
+    toast.info('正在拉取更新并重新部署，请稍候...')
+    const result = await updateAndRestart()
+    setUpdating(false)
+    if (result.success) {
+      toast.success(result.message)
+      window.location.reload()
     } else {
       toast.error(result.message)
     }
@@ -536,7 +550,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRestart} disabled={restarting} title="重启服务">
+            <Button variant="ghost" size="icon" onClick={handleUpdate} disabled={updating || restarting} title="拉取更新并重启">
+              <Download className={`h-5 w-5 ${updating ? 'animate-bounce' : ''}`} />
+            </Button>
+            <Button variant="ghost" size="icon" onClick={handleRestart} disabled={restarting || updating} title="重启服务">
               <Power className={`h-5 w-5 ${restarting ? 'animate-spin' : ''}`} />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
