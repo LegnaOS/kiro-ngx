@@ -20,6 +20,7 @@ class CredentialStatusItem:
     refresh_token_hash: Optional[str] = None
     email: Optional[str] = None
     success_count: int = 0
+    session_count: int = 0
     last_used_at: Optional[str] = None
     has_proxy: bool = False
     proxy_url: Optional[str] = None
@@ -37,6 +38,7 @@ class CredentialStatusItem:
             "refreshTokenHash": self.refresh_token_hash,
             "email": self.email,
             "successCount": self.success_count,
+            "sessionCount": self.session_count,
             "lastUsedAt": self.last_used_at,
             "hasProxy": self.has_proxy,
         }

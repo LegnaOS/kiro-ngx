@@ -57,6 +57,7 @@ class AdminService:
                 refresh_token_hash=entry.refresh_token_hash,
                 email=entry.email,
                 success_count=entry.success_count,
+                session_count=entry.session_count,
                 last_used_at=entry.last_used_at,
                 has_proxy=entry.has_proxy,
                 proxy_url=entry.proxy_url,
