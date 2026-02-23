@@ -116,15 +116,10 @@ def _is_web_search_tool(t: dict) -> bool:
 
 
 def is_pure_websearch_request(req: MessagesRequest) -> bool:
-    """判断是否为纯 WebSearch 请求（只有 web_search 工具，或消息明确是搜索指令）"""
+    """判断是否为 CC 发出的纯 WebSearch 请求（消息以搜索指令前缀开头）"""
     if not has_web_search_tool(req):
         return False
-    # 只有一个工具且是 web_search → 纯搜索
-    if req.tools and len(req.tools) == 1:
-        return True
-    # 多工具时，检查最后一条 user 消息是否为搜索指令
-    query = extract_search_query(req)
-    return query is not None and "Perform a web search for the query:" in _get_last_user_text(req)
+    return "Perform a web search for the query:" in _get_last_user_text(req)
 
 
 def strip_web_search_tools(req: MessagesRequest) -> None:
