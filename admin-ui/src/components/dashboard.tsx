@@ -13,7 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { CredentialsEditorDialog } from '@/components/credentials-editor-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, getSystemStats, restartServer, updateAndRestart } from '@/api/credentials'
+import { getCredentialBalance, getSystemStats, restartServer, updateAndRestart, getVersionInfo, type VersionInfo } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -57,6 +57,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [systemStats, setSystemStats] = useState<{ cpuPercent: number; memoryMb: number } | null>(null)
   const [restarting, setRestarting] = useState(false)
   const [updating, setUpdating] = useState(false)
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
 
   useEffect(() => {
     const fetchStats = () => {
@@ -64,6 +65,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     fetchStats()
     const timer = setInterval(fetchStats, 5000)
+    return () => clearInterval(timer)
+  }, [])
+
+  // 版本检查（启动时 + 每 60 秒）
+  useEffect(() => {
+    const checkVersion = () => {
+      getVersionInfo().then(setVersionInfo).catch(() => {})
+    }
+    checkVersion()
+    const timer = setInterval(checkVersion, 60000)
     return () => clearInterval(timer)
   }, [])
 
@@ -536,6 +547,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="flex items-center gap-2">
             <Server className="h-5 w-5" />
             <span className="font-semibold">Kiro Admin</span>
+            {versionInfo && (
+              <span className="text-xs text-muted-foreground ml-1">
+                {versionInfo.current.hash}
+              </span>
+            )}
+            {versionInfo?.hasUpdate && (
+              <Badge
+                variant="outline"
+                className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950"
+                onClick={handleUpdate}
+              >
+                新版本: {versionInfo.latest.hash}
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -550,8 +575,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleUpdate} disabled={updating || restarting} title="拉取更新并重启">
-              <Download className={`h-5 w-5 ${updating ? 'animate-bounce' : ''}`} />
+            <Button variant="ghost" size="icon" onClick={handleUpdate} disabled={updating || restarting} title={versionInfo?.hasUpdate ? `更新到 ${versionInfo.latest.hash}: ${versionInfo.latest.message}` : '拉取更新并重启'}>
+              <Download className={`h-5 w-5 ${updating ? 'animate-bounce' : versionInfo?.hasUpdate ? 'text-orange-500' : ''}`} />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleRestart} disabled={restarting || updating} title="重启服务">
               <Power className={`h-5 w-5 ${restarting ? 'animate-spin' : ''}`} />

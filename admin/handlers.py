@@ -294,6 +294,61 @@ async def get_system_stats(request: Request) -> JSONResponse:
     })
 
 
+def _git_commit_info(ref: str = "HEAD") -> dict:
+    """获取指定 ref 的 commit 短哈希和摘要"""
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    try:
+        r = subprocess.run(
+            ["git", "log", "-1", "--format=%h|%s|%ci", ref],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts = r.stdout.strip().split("|", 2)
+            return {"hash": parts[0], "message": parts[1] if len(parts) > 1 else "", "date": parts[2] if len(parts) > 2 else ""}
+    except Exception:
+        pass
+    return {"hash": "unknown", "message": "", "date": ""}
+
+
+async def get_version_info(request: Request) -> JSONResponse:
+    """GET /version - 获取当前版本和远程最新版本"""
+    import asyncio
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    loop = asyncio.get_event_loop()
+
+    def _fetch():
+        # 获取本地当前版本
+        local = _git_commit_info("HEAD")
+
+        # fetch 远程最新
+        try:
+            subprocess.run(
+                ["git", "fetch", "origin", "--quiet"],
+                cwd=str(root), capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            pass
+
+        remote = _git_commit_info("origin/master")
+
+        # 检查是否有更新：本地 hash != 远程 hash
+        has_update = local["hash"] != "unknown" and remote["hash"] != "unknown" and local["hash"] != remote["hash"]
+
+        return {
+            "current": local,
+            "latest": remote,
+            "hasUpdate": has_update,
+        }
+
+    result = await loop.run_in_executor(None, _fetch)
+    return JSONResponse(content=result)
+
+
 async def restart_server(request: Request) -> JSONResponse:
     """POST /restart - 重启服务"""
     import asyncio

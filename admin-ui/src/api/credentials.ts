@@ -115,6 +115,18 @@ export async function getSystemStats(): Promise<{ cpuPercent: number; memoryMb: 
   return data
 }
 
+// 版本信息
+export interface VersionInfo {
+  current: { hash: string; message: string; date: string }
+  latest: { hash: string; message: string; date: string }
+  hasUpdate: boolean
+}
+
+export async function getVersionInfo(): Promise<VersionInfo> {
+  const { data } = await api.get<VersionInfo>('/version')
+  return data
+}
+
 // 重启服务（发送请求后轮询等待服务恢复）
 export async function restartServer(): Promise<{ success: boolean; message: string }> {
   try {
