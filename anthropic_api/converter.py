@@ -156,11 +156,15 @@ def _process_message_content(content: Any) -> Tuple[str, List[KiroImage], List[T
 
 
 def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
-    """转换工具定义"""
+    """转换工具定义（跳过 server-side tool 如 web_search）"""
     if not tools:
         return []
     result = []
     for t in tools:
+        # 跳过 server-side tool（type 以 web_search 开头、无 input_schema）
+        tool_type = t.get("type", "")
+        if tool_type and tool_type.startswith("web_search"):
+            continue
         desc = t.get("description", "")
         name = t.get("name", "")
         suffix = ""

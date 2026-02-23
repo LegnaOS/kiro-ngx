@@ -18,6 +18,7 @@ from .types import (
     MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking,
 )
 from . import websearch
+from .message_log import get_message_logger
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,16 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
         for sse in ctx.generate_final_events():
             yield sse.to_sse_string()
 
+        # 记录流式响应日志
+        msg_logger = get_message_logger()
+        if msg_logger and msg_logger.enabled:
+            final_input = ctx.context_input_tokens if ctx.context_input_tokens is not None else input_tokens
+            msg_logger.log_stream_text(
+                model=model, text=ctx.accumulated_text,
+                stop_reason=ctx.state_manager.get_stop_reason(),
+                usage={"input_tokens": final_input, "output_tokens": ctx.output_tokens},
+            )
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -169,6 +180,17 @@ async def _handle_stream_request_buffered(provider, request_body: str, model: st
 
         for sse in buf_ctx.finish_and_get_all_events():
             yield sse.to_sse_string()
+
+        # 记录流式响应日志
+        msg_logger = get_message_logger()
+        if msg_logger and msg_logger.enabled:
+            inner = buf_ctx.inner
+            final_input = inner.context_input_tokens if inner.context_input_tokens is not None else estimated_input_tokens
+            msg_logger.log_stream_text(
+                model=model, text=inner.accumulated_text,
+                stop_reason=inner.state_manager.get_stop_reason(),
+                usage={"input_tokens": final_input, "output_tokens": inner.output_tokens},
+            )
 
     return StreamingResponse(
         event_generator(),
@@ -272,6 +294,15 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
     output_tokens = token_module.estimate_output_tokens(content)
     final_input = context_input_tokens if context_input_tokens is not None else input_tokens
 
+    # 记录响应日志
+    msg_logger = get_message_logger()
+    if msg_logger and msg_logger.enabled:
+        msg_logger.log_response(
+            model=model, content=content,
+            stop_reason=stop_reason,
+            usage={"input_tokens": final_input, "output_tokens": output_tokens},
+        )
+
     return JSONResponse(content={
         "id": f"msg_{uuid.uuid4().hex}", "type": "message", "role": "assistant",
         "content": content, "model": model,
@@ -291,12 +322,26 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
 
     _override_thinking_from_model_name(payload)
 
-    if websearch.has_web_search_tool(payload):
-        logger.info("检测到 WebSearch 工具，路由到 WebSearch 处理")
+    # 记录请求日志
+    msg_logger = get_message_logger()
+    if msg_logger and msg_logger.enabled:
+        msg_logger.log_request(
+            model=payload.model,
+            messages=payload.messages,
+            system=payload.system,
+            tools=payload.tools,
+            stream=payload.stream,
+        )
+
+    if websearch.is_pure_websearch_request(payload):
+        logger.info("检测到纯 WebSearch 请求，路由到 WebSearch 处理")
         input_tokens = token_module.count_all_tokens(
             payload.model, payload.system, payload.messages, payload.tools,
         )
         return await websearch.handle_websearch_request(provider, payload, input_tokens)
+
+    # 非纯搜索请求时，剥离 web_search 工具（Kiro 不支持）
+    websearch.strip_web_search_tools(payload)
 
     try:
         result = convert_request(payload)

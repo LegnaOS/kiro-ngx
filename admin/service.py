@@ -10,7 +10,6 @@ from typing import Optional
 from admin.types import (
     AddCredentialRequest, AddCredentialResponse, BalanceResponse,
     CredentialStatusItem, CredentialsStatusResponse,
-    LoadBalancingModeResponse, SetLoadBalancingModeRequest,
 )
 from admin.error import (
     AdminServiceError, NotFoundError, UpstreamError,
@@ -32,19 +31,38 @@ class AdminService:
         self._balance_cache: dict[int, dict] = {}  # {id: {"cached_at": float, "data": BalanceResponse}}
         self._cache_lock = threading.Lock()
         self._cache_path: Optional[Path] = None
+        self._groups: dict[int, str] = {}  # {credential_id: "free"|"pro"|"priority"}
+        self._groups_path: Optional[Path] = None
+        self._routing_path: Optional[Path] = None
 
         cache_dir = getattr(token_manager, "cache_dir", None)
         if callable(cache_dir):
             d = cache_dir()
             if d:
                 self._cache_path = Path(d) / "kiro_balance_cache.json"
+                self._groups_path = Path(d) / "kiro_groups.json"
+                self._routing_path = Path(d) / "kiro_routing.json"
         self._load_balance_cache()
+        self._load_groups()
+        self._load_routing()
+        self._sync_groups_to_manager()
 
     def get_all_credentials(self) -> CredentialsStatusResponse:
         """获取所有凭据状态"""
         snapshot = self.token_manager.snapshot()
         credentials = []
         for entry in snapshot.entries:
+            # 自动分组：FREE → free，其他 → pro（除非手动设为 priority）
+            sub_title = entry.subscription_title
+            saved_group = self._groups.get(entry.id)
+            is_free = sub_title and "FREE" in sub_title.upper()
+            if is_free:
+                group = "free"
+            elif saved_group in ("pro", "priority"):
+                group = saved_group
+            else:
+                group = "pro"
+
             credentials.append(CredentialStatusItem(
                 id=entry.id,
                 priority=entry.priority,
@@ -61,8 +79,12 @@ class AdminService:
                 last_used_at=entry.last_used_at,
                 has_proxy=entry.has_proxy,
                 proxy_url=entry.proxy_url,
+                subscription_title=sub_title,
+                group=group,
             ))
         credentials.sort(key=lambda c: c.priority)
+        # 同步分组到 token_manager 用于路由
+        self._sync_groups_to_manager()
         return CredentialsStatusResponse(
             total=snapshot.total,
             available=snapshot.available,
@@ -187,16 +209,21 @@ class AdminService:
             self._balance_cache.pop(id, None)
         self._save_balance_cache()
 
-    def get_load_balancing_mode(self) -> LoadBalancingModeResponse:
-        return LoadBalancingModeResponse(mode=self.token_manager.get_load_balancing_mode())
-    def set_load_balancing_mode(self, req: SetLoadBalancingModeRequest) -> LoadBalancingModeResponse:
-        if req.mode not in ("priority", "balanced"):
-            raise InvalidCredentialError("mode 必须是 'priority' 或 'balanced'")
-        try:
-            self.token_manager.set_load_balancing_mode(req.mode)
-        except Exception as e:
-            raise InternalError(str(e))
-        return LoadBalancingModeResponse(mode=req.mode)
+    def set_credential_group(self, cid: int, group: str) -> None:
+        """设置凭据分组"""
+        if group not in ("free", "pro", "priority"):
+            raise InvalidCredentialError(f"无效的分组: {group}")
+        self._groups[cid] = group
+        self._save_groups()
+
+    def set_credential_groups_batch(self, groups: dict[int, str]) -> None:
+        """批量设置凭据分组"""
+        for cid, group in groups.items():
+            if group not in ("free", "pro", "priority"):
+                raise InvalidCredentialError(f"无效的分组: {group}")
+            self._groups[cid] = group
+        self._save_groups()
+        self._sync_groups_to_manager()
 
     # ============ 余额缓存持久化 ============
 
@@ -242,6 +269,84 @@ class AdminService:
             )
         except Exception as e:
             logger.warning("保存余额缓存失败: %s", e)
+
+    # ============ 分组持久化 ============
+
+    def _load_groups(self):
+        if not self._groups_path or not self._groups_path.exists():
+            return
+        try:
+            data = json.loads(self._groups_path.read_text(encoding="utf-8"))
+            self._groups = {int(k): v for k, v in data.items()}
+        except Exception as e:
+            logger.warning("解析分组缓存失败，将忽略: %s", e)
+
+    def _save_groups(self):
+        if not self._groups_path:
+            return
+        try:
+            self._groups_path.parent.mkdir(parents=True, exist_ok=True)
+            self._groups_path.write_text(
+                json.dumps({str(k): v for k, v in self._groups.items()}, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("保存分组缓存失败: %s", e)
+
+    def _sync_groups_to_manager(self):
+        """将当前分组信息同步到 token_manager 用于路由决策"""
+        try:
+            # 构建完整分组映射（包含自动分组）
+            snapshot = self.token_manager.snapshot()
+            full_groups: dict[int, str] = {}
+            for entry in snapshot.entries:
+                sub_title = entry.subscription_title
+                saved_group = self._groups.get(entry.id)
+                is_free = sub_title and "FREE" in sub_title.upper()
+                if is_free:
+                    full_groups[entry.id] = "free"
+                elif saved_group in ("pro", "priority"):
+                    full_groups[entry.id] = saved_group
+                else:
+                    full_groups[entry.id] = "pro"
+            self.token_manager.update_groups(full_groups)
+        except Exception as e:
+            logger.warning("同步分组到 token_manager 失败: %s", e)
+
+    # ============ 路由配置持久化 ============
+
+    def _load_routing(self):
+        if not self._routing_path or not self._routing_path.exists():
+            return
+        try:
+            data = json.loads(self._routing_path.read_text(encoding="utf-8"))
+            free_models = set(data.get("freeModels", []))
+            self.token_manager.update_free_models(free_models)
+        except Exception as e:
+            logger.warning("解析路由配置失败，将忽略: %s", e)
+
+    def _save_routing(self):
+        if not self._routing_path:
+            return
+        try:
+            free_models = sorted(self.token_manager.get_free_models())
+            self._routing_path.parent.mkdir(parents=True, exist_ok=True)
+            self._routing_path.write_text(
+                json.dumps({"freeModels": free_models}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("保存路由配置失败: %s", e)
+
+    def get_free_models(self) -> list[str]:
+        return sorted(self.token_manager.get_free_models())
+
+    def set_free_models(self, models: list[str]) -> None:
+        self.token_manager.update_free_models(set(models))
+        self._save_routing()
+
+    def get_stats(self) -> dict:
+        return self.token_manager.get_stats()
 
     # ============ 错误分类 ============
 

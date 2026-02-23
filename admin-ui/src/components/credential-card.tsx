@@ -214,7 +214,7 @@ export function CredentialCard({
               <span className="font-medium">
                 {loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                ) : credential.subscriptionTitle || balance?.subscriptionTitle || '未知'}
               </span>
             </div>
             <div>

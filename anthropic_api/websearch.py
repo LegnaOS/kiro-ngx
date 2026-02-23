@@ -104,17 +104,65 @@ def _random_lower_alnum(n: int) -> str:
 
 
 def has_web_search_tool(req: MessagesRequest) -> bool:
+    """检查请求中是否包含 web_search 工具（兼容 name 和 type 两种标识）"""
     tools = req.tools
-    if not tools or len(tools) != 1:
+    if not tools:
         return False
-    return tools[0].get("name") == "web_search"
+    return any(_is_web_search_tool(t) for t in tools)
+
+
+def _is_web_search_tool(t: dict) -> bool:
+    return t.get("name") == "web_search" or (t.get("type") or "").startswith("web_search")
+
+
+def is_pure_websearch_request(req: MessagesRequest) -> bool:
+    """判断是否为纯 WebSearch 请求（只有 web_search 工具，或消息明确是搜索指令）"""
+    if not has_web_search_tool(req):
+        return False
+    # 只有一个工具且是 web_search → 纯搜索
+    if req.tools and len(req.tools) == 1:
+        return True
+    # 多工具时，检查最后一条 user 消息是否为搜索指令
+    query = extract_search_query(req)
+    return query is not None and "Perform a web search for the query:" in _get_last_user_text(req)
+
+
+def strip_web_search_tools(req: MessagesRequest) -> None:
+    """从 tools 列表中移除 web_search 工具（Kiro 不支持）"""
+    if req.tools:
+        req.tools = [t for t in req.tools if not _is_web_search_tool(t)]
+        if not req.tools:
+            req.tools = None
+
+
+def _get_last_user_text(req: MessagesRequest) -> str:
+    """获取最后一条 user 消息的文本"""
+    for msg in reversed(req.messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        return block.get("text", "")
+            return ""
+    return ""
 
 
 def extract_search_query(req: MessagesRequest) -> Optional[str]:
+    """从最后一条 user 消息中提取搜索查询"""
     if not req.messages:
         return None
-    first = req.messages[0]
-    content = first.get("content", "")
+    # 从后往前找最后一条 user 消息
+    target = None
+    for msg in reversed(req.messages):
+        if msg.get("role") == "user":
+            target = msg
+            break
+    if not target:
+        target = req.messages[-1]
+    content = target.get("content", "")
     if isinstance(content, str):
         text = content
     elif isinstance(content, list) and content:

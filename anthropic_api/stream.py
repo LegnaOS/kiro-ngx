@@ -219,6 +219,7 @@ class StreamContext:
         self.thinking_block_index: Optional[int] = None
         self.text_block_index: Optional[int] = None
         self._strip_thinking_leading_newline = False
+        self.accumulated_text = ""  # 累积文本，用于日志记录
 
     def create_message_start_event(self) -> dict:
         return {
@@ -355,6 +356,7 @@ class StreamContext:
 
     def _create_text_delta_events(self, text: str) -> List[SseEvent]:
         events: List[SseEvent] = []
+        self.accumulated_text += text  # 累积文本用于日志
         # 如果当前 text block 已被关闭，丢弃索引
         if self.text_block_index is not None:
             if not self.state_manager._is_block_open_of_type(self.text_block_index, "text"):

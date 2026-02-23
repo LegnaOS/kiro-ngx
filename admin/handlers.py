@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from admin.error import AdminServiceError
 from admin.types import (
-    AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+    AddCredentialRequest, SetDisabledRequest,
     SetPriorityRequest, SuccessResponse,
 )
 
@@ -169,23 +169,30 @@ async def save_raw_credentials(request: Request) -> JSONResponse:
     })
 
 
-async def get_load_balancing_mode(request: Request) -> JSONResponse:
-    """GET /config/load-balancing"""
-    service = request.app.state.admin_service
-    response = service.get_load_balancing_mode()
-    return JSONResponse(content=response.to_dict())
-
-
-async def set_load_balancing_mode(request: Request) -> JSONResponse:
-    """PUT /config/load-balancing"""
+async def set_credential_group(request: Request, id: int) -> JSONResponse:
+    """POST /credentials/{id}/group - 设置凭据分组"""
     service = request.app.state.admin_service
     body = await request.json()
-    payload = SetLoadBalancingModeRequest.from_dict(body)
+    group = body.get("group", "pro")
     try:
-        response = service.set_load_balancing_mode(payload)
+        service.set_credential_group(id, group)
     except AdminServiceError as e:
         return _error_response(e)
-    return JSONResponse(content=response.to_dict())
+    return JSONResponse(content=SuccessResponse.new(f"凭据 #{id} 分组已设置为 {group}").to_dict())
+
+
+async def set_credential_groups_batch(request: Request) -> JSONResponse:
+    """PUT /credentials/groups - 批量设置凭据分组"""
+    service = request.app.state.admin_service
+    body = await request.json()
+    groups = body.get("groups", {})
+    # 转换 key 为 int
+    int_groups = {int(k): v for k, v in groups.items()}
+    try:
+        service.set_credential_groups_batch(int_groups)
+    except AdminServiceError as e:
+        return _error_response(e)
+    return JSONResponse(content=SuccessResponse.new(f"已更新 {len(int_groups)} 个凭据分组").to_dict())
 
 
 def _get_process_memory_mb() -> float:
@@ -438,3 +445,56 @@ async def update_and_restart(request: Request) -> JSONResponse:
 
     asyncio.ensure_future(_do_update())
     return JSONResponse(content={"success": True, "message": "正在更新并重启..."})
+
+
+# ============ 统计 & 路由 ============
+
+async def get_request_stats(request: Request) -> JSONResponse:
+    """GET /stats - 获取请求统计数据"""
+    service = request.app.state.admin_service
+    stats = service.get_stats()
+    return JSONResponse(content=stats)
+
+
+async def get_model_list(request: Request) -> JSONResponse:
+    """GET /models - 获取支持的模型列表"""
+    from anthropic_api.handlers import MODELS
+    models = [{"id": m.id, "displayName": m.display_name} for m in MODELS]
+    return JSONResponse(content={"models": models})
+
+
+async def get_routing_config(request: Request) -> JSONResponse:
+    """GET /routing - 获取路由配置"""
+    service = request.app.state.admin_service
+    free_models = service.get_free_models()
+    return JSONResponse(content={"freeModels": free_models})
+
+
+async def set_routing_config(request: Request) -> JSONResponse:
+    """PUT /routing - 更新路由配置"""
+    service = request.app.state.admin_service
+    body = await request.json()
+    free_models = body.get("freeModels", [])
+    if not isinstance(free_models, list):
+        return JSONResponse(status_code=400, content={"success": False, "message": "freeModels 必须是数组"})
+    service.set_free_models(free_models)
+    return JSONResponse(content=SuccessResponse.new(f"路由配置已更新（{len(free_models)} 个免费模型）").to_dict())
+
+
+async def get_log_status(request: Request) -> JSONResponse:
+    """GET /log - 获取日志开关状态"""
+    from anthropic_api.message_log import get_message_logger
+    ml = get_message_logger()
+    return JSONResponse(content={"enabled": ml.enabled if ml else False})
+
+
+async def set_log_status(request: Request) -> JSONResponse:
+    """PUT /log - 设置日志开关"""
+    from anthropic_api.message_log import get_message_logger
+    body = await request.json()
+    enabled = body.get("enabled", False)
+    ml = get_message_logger()
+    if not ml:
+        return JSONResponse(status_code=500, content={"success": False, "message": "日志模块未初始化"})
+    ml.set_enabled(enabled)
+    return JSONResponse(content=SuccessResponse.new(f"消息日志已{'开启' if enabled else '关闭'}").to_dict())

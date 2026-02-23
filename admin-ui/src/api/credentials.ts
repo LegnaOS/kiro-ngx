@@ -8,6 +8,9 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  RequestStats,
+  ModelInfo,
+  RoutingConfig,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -85,15 +88,9 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
-// 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
-  return data
-}
-
-// 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+// 批量设置凭据分组
+export async function setCredentialGroups(groups: Record<number, string>): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/credentials/groups', { groups })
   return data
 }
 
@@ -127,6 +124,40 @@ export async function getVersionInfo(): Promise<VersionInfo> {
   return data
 }
 
+// 请求统计
+export async function getRequestStats(): Promise<RequestStats> {
+  const { data } = await api.get<RequestStats>('/stats')
+  return data
+}
+
+// 模型列表
+export async function getModelList(): Promise<ModelInfo[]> {
+  const { data } = await api.get<{ models: ModelInfo[] }>('/models')
+  return data.models
+}
+
+// 路由配置
+export async function getRoutingConfig(): Promise<RoutingConfig> {
+  const { data } = await api.get<RoutingConfig>('/routing')
+  return data
+}
+
+export async function setRoutingConfig(config: RoutingConfig): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/routing', config)
+  return data
+}
+
+// 消息日志开关
+export async function getLogStatus(): Promise<{ enabled: boolean }> {
+  const { data } = await api.get<{ enabled: boolean }>('/log')
+  return data
+}
+
+export async function setLogStatus(enabled: boolean): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/log', { enabled })
+  return data
+}
+
 // 重启服务（发送请求后轮询等待服务恢复）
 export async function restartServer(): Promise<{ success: boolean; message: string }> {
   try {
@@ -155,7 +186,6 @@ export async function updateAndRestart(): Promise<{ success: boolean; message: s
   } catch {
     // 更新重启导致连接断开是正常的
   }
-  // 更新+构建+重启需要更长时间
   const maxAttempts = 120
   const interval = 2000
   for (let i = 0; i < maxAttempts; i++) {

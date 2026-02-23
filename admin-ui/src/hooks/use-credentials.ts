@@ -7,8 +7,7 @@ import {
   getCredentialBalance,
   addCredential,
   deleteCredential,
-  getLoadBalancingMode,
-  setLoadBalancingMode,
+  setCredentialGroups,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -17,7 +16,7 @@ export function useCredentials() {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval: 30000,
   })
 }
 
@@ -27,7 +26,7 @@ export function useCredentialBalance(id: number | null) {
     queryKey: ['credential-balance', id],
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
-    retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+    retry: false,
   })
 }
 
@@ -88,21 +87,13 @@ export function useDeleteCredential() {
   })
 }
 
-// 获取负载均衡模式
-export function useLoadBalancingMode() {
-  return useQuery({
-    queryKey: ['loadBalancingMode'],
-    queryFn: getLoadBalancingMode,
-  })
-}
-
-// 设置负载均衡模式
-export function useSetLoadBalancingMode() {
+// 批量设置分组
+export function useSetCredentialGroups() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: setLoadBalancingMode,
+    mutationFn: (groups: Record<number, string>) => setCredentialGroups(groups),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

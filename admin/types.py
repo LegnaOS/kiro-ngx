@@ -24,6 +24,8 @@ class CredentialStatusItem:
     last_used_at: Optional[str] = None
     has_proxy: bool = False
     proxy_url: Optional[str] = None
+    subscription_title: Optional[str] = None
+    group: Optional[str] = None  # "free" | "pro" | "priority"
 
     def to_dict(self) -> dict:
         d = {
@@ -41,6 +43,8 @@ class CredentialStatusItem:
             "sessionCount": self.session_count,
             "lastUsedAt": self.last_used_at,
             "hasProxy": self.has_proxy,
+            "subscriptionTitle": self.subscription_title,
+            "group": self.group,
         }
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url
@@ -133,25 +137,6 @@ class BalanceResponse:
             "usagePercentage": self.usage_percentage,
             "nextResetAt": self.next_reset_at,
         }
-
-
-# ============ 负载均衡配置 ============
-
-@dataclass
-class LoadBalancingModeResponse:
-    mode: str = "priority"
-
-    def to_dict(self) -> dict:
-        return {"mode": self.mode}
-
-
-@dataclass
-class SetLoadBalancingModeRequest:
-    mode: str = "priority"
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "SetLoadBalancingModeRequest":
-        return cls(mode=data.get("mode", "priority"))
 
 
 # ============ 通用响应 ============

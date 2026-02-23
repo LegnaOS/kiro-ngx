@@ -23,6 +23,8 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  subscriptionTitle: string | null
+  group: 'free' | 'pro' | 'priority' | null
 }
 
 // 余额响应
@@ -80,4 +82,27 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+// 统计数据
+export interface RequestStats {
+  totalRequests: number
+  sessionRequests: number
+  rpm: number
+  peakRpm: number
+  modelCounts: Record<string, number>
+  modelCredCounts: Record<string, Record<string, number>>  // {model: {credId: count}}
+  credentialCount: number
+  availableCount: number
+}
+
+// 模型信息
+export interface ModelInfo {
+  id: string
+  displayName: string
+}
+
+// 路由配置
+export interface RoutingConfig {
+  freeModels: string[]
 }

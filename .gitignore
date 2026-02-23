@@ -13,6 +13,11 @@ credentials.json
 config.json
 kiro_stats.json
 kiro_balance_cache.json
+kiro_groups.json
+kiro_routing.json
+
+# 日志
+logs/
 
 # Node / 前端
 admin-ui/node_modules/

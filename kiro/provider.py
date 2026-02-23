@@ -216,7 +216,7 @@ class KiroProvider:
             status = response.status_code
 
             if 200 <= status < 300:
-                self._token_manager.report_success(ctx.id)
+                self._token_manager.report_success(ctx.id, model)
                 return response
 
             # 错误时需要读取 body（流式模式下 body 尚未读取）

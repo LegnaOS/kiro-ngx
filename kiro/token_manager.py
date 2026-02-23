@@ -383,6 +383,7 @@ class CredentialEntrySnapshot:
     last_used_at: Optional[str]
     has_proxy: bool
     proxy_url: Optional[str] = None
+    subscription_title: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -392,6 +393,7 @@ class CredentialEntrySnapshot:
             "refreshTokenHash": self.refresh_token_hash, "email": self.email,
             "successCount": self.success_count, "sessionCount": self.session_count,
             "lastUsedAt": self.last_used_at, "hasProxy": self.has_proxy,
+            "subscriptionTitle": self.subscription_title,
         }
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url
@@ -486,7 +488,12 @@ class MultiTokenManager:
         self._current_id = initial_id
         self._lock = threading.Lock()  # 保护同步数据
         self._refresh_lock = asyncio.Lock()  # 保护异步刷新操作
-        self._load_balancing_mode = config.load_balancing_mode
+        self._groups: dict[int, str] = {}  # {credential_id: "free"|"pro"|"priority"}
+        self._free_models: set[str] = set()  # 免费账号支持的模型 ID 集合
+        self._request_timestamps: list[float] = []  # RPM 滑动窗口
+        self._peak_rpm: int = 0
+        self._model_call_counts: dict[str, int] = {}  # 每模型本次会话调用计数
+        self._model_cred_counts: dict[str, dict[int, int]] = {}  # {model: {cred_id: count}} 细粒度
         self._last_stats_save_at: Optional[float] = None
         self._stats_dirty = False
 
@@ -518,8 +525,43 @@ class MultiTokenManager:
         with self._lock:
             return sum(1 for e in self._entries if not e.disabled)
 
+    def _model_is_free(self, model: str) -> bool:
+        """判断模型是否在免费列表中（支持 Kiro 内部 ID 和 Anthropic ID 两种格式匹配）"""
+        if not self._free_models:
+            return False
+        # 直接匹配
+        if model in self._free_models:
+            return True
+        # Kiro 内部 ID（如 claude-sonnet-4.5）匹配 Anthropic ID（如 claude-sonnet-4-5-20250929）
+        ml = model.lower()
+        for fm in self._free_models:
+            fl = fm.lower()
+            # 提取模型族关键词匹配
+            if "sonnet" in ml and "sonnet" in fl:
+                # 版本匹配：4.5 ↔ 4-5, 4.6 ↔ 4-6
+                if ("4.5" in ml or "4-5" in ml) and ("4.5" in fl or "4-5" in fl):
+                    # thinking 后缀匹配
+                    m_think = "thinking" in ml
+                    f_think = "thinking" in fl
+                    if m_think == f_think:
+                        return True
+                elif ("4.6" in ml or "4-6" in ml) and ("4.6" in fl or "4-6" in fl):
+                    if ("thinking" in ml) == ("thinking" in fl):
+                        return True
+            elif "opus" in ml and "opus" in fl:
+                if ("4.5" in ml or "4-5" in ml) and ("4.5" in fl or "4-5" in fl):
+                    if ("thinking" in ml) == ("thinking" in fl):
+                        return True
+                elif ("4.6" in ml or "4-6" in ml) and ("4.6" in fl or "4-6" in fl):
+                    if ("thinking" in ml) == ("thinking" in fl):
+                        return True
+            elif "haiku" in ml and "haiku" in fl:
+                if ("thinking" in ml) == ("thinking" in fl):
+                    return True
+        return False
+
     def _select_next_credential(self, model: Optional[str] = None) -> Optional[tuple[int, KiroCredentials]]:
-        """根据负载均衡模式选择下一个凭据（需在 _lock 内调用）"""
+        """根据负载均衡 + 分组路由选择下一个凭据（需在 _lock 内调用）"""
         is_opus = model and "opus" in model.lower() if model else False
 
         available = [
@@ -529,13 +571,23 @@ class MultiTokenManager:
         if not available:
             return None
 
-        mode = self._load_balancing_mode
-        if mode == "balanced":
-            # Least-Used 策略：按本次运行成功次数选择，平局按优先级
-            entry = min(available, key=lambda e: (e.session_count, e.credentials.priority))
-        else:
-            # priority 模式（默认）
-            entry = min(available, key=lambda e: e.credentials.priority)
+        # 分组路由：免费模型优先走 free 组，非免费模型排除 free 组
+        if model and self._free_models:
+            if self._model_is_free(model):
+                free_creds = [e for e in available if self._groups.get(e.id) == "free"]
+                if free_creds:
+                    entry = min(free_creds, key=lambda e: (e.session_count, e.credentials.priority))
+                    logger.debug("模型 %s 路由到 free 组凭据 #%d", model, entry.id)
+                    return (entry.id, entry.credentials.clone())
+                # free 组耗尽，回退到 pro/priority
+                logger.debug("模型 %s 为免费模型但 free 组无可用凭据，回退", model)
+            else:
+                non_free = [e for e in available if self._groups.get(e.id) != "free"]
+                if non_free:
+                    available = non_free
+
+        # Least-Used 负载均衡
+        entry = min(available, key=lambda e: (e.session_count, e.credentials.priority))
         return (entry.id, entry.credentials.clone())
 
     def _switch_to_next_by_priority(self):
@@ -570,41 +622,29 @@ class MultiTokenManager:
                 )
 
             with self._lock:
-                is_balanced = self._load_balancing_mode == "balanced"
+                best = self._select_next_credential(model)
 
-                current_hit = None
-                if not is_balanced:
-                    for e in self._entries:
-                        if e.id == self._current_id and not e.disabled:
-                            current_hit = (e.id, e.credentials.clone())
-                            break
+                # 自愈：如果所有凭据都被自动禁用，重置
+                if best is None:
+                    has_auto_disabled = any(
+                        e.disabled and e.disabled_reason == _DisabledReason.TOO_MANY_FAILURES
+                        for e in self._entries
+                    )
+                    if has_auto_disabled:
+                        logger.warning("所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用")
+                        for e in self._entries:
+                            if e.disabled_reason == _DisabledReason.TOO_MANY_FAILURES:
+                                e.disabled = False
+                                e.disabled_reason = None
+                                e.failure_count = 0
+                        best = self._select_next_credential(model)
 
-                if current_hit:
-                    cid, cred = current_hit
+                if best:
+                    cid, cred = best
+                    self._current_id = cid
                 else:
-                    best = self._select_next_credential(model)
-
-                    # 自愈：如果所有凭据都被自动禁用，重置
-                    if best is None:
-                        has_auto_disabled = any(
-                            e.disabled and e.disabled_reason == _DisabledReason.TOO_MANY_FAILURES
-                            for e in self._entries
-                        )
-                        if has_auto_disabled:
-                            logger.warning("所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用")
-                            for e in self._entries:
-                                if e.disabled_reason == _DisabledReason.TOO_MANY_FAILURES:
-                                    e.disabled = False
-                                    e.disabled_reason = None
-                                    e.failure_count = 0
-                            best = self._select_next_credential(model)
-
-                    if best:
-                        cid, cred = best
-                        self._current_id = cid
-                    else:
-                        available = sum(1 for e in self._entries if not e.disabled)
-                        raise RuntimeError(f"所有凭据均已禁用（{available}/{total}）")
+                    available = sum(1 for e in self._entries if not e.disabled)
+                    raise RuntimeError(f"所有凭据均已禁用（{available}/{total}）")
 
             # 尝试获取/刷新 Token
             try:
@@ -656,8 +696,9 @@ class MultiTokenManager:
             raise RuntimeError("没有可用的 accessToken")
         return CallContext(id=cid, credentials=creds, token=creds.access_token)
 
-    def report_success(self, cid: int):
+    def report_success(self, cid: int, model: Optional[str] = None):
         """报告指定凭据 API 调用成功"""
+        now = time.time()
         with self._lock:
             for e in self._entries:
                 if e.id == cid:
@@ -667,6 +708,21 @@ class MultiTokenManager:
                     e.last_used_at = _utc_now().isoformat()
                     logger.debug("凭据 #%d API 调用成功（本次 %d / 累计 %d）", cid, e.session_count, e.success_count)
                     break
+            # RPM 追踪
+            self._request_timestamps.append(now)
+            cutoff = now - 60
+            self._request_timestamps = [t for t in self._request_timestamps if t > cutoff]
+            current_rpm = len(self._request_timestamps)
+            if current_rpm > self._peak_rpm:
+                self._peak_rpm = current_rpm
+            # 每模型计数
+            if model:
+                self._model_call_counts[model] = self._model_call_counts.get(model, 0) + 1
+                # 细粒度：model + credential_id
+                if model not in self._model_cred_counts:
+                    self._model_cred_counts[model] = {}
+                mc = self._model_cred_counts[model]
+                mc[cid] = mc.get(cid, 0) + 1
         self._save_stats_debounced()
 
     def report_failure(self, cid: int) -> bool:
@@ -776,6 +832,7 @@ class MultiTokenManager:
                     last_used_at=e.last_used_at,
                     has_proxy=e.credentials.proxy_url is not None,
                     proxy_url=e.credentials.proxy_url,
+                    subscription_title=e.credentials.subscription_title,
                 ))
             return ManagerSnapshot(
                 entries=snap_entries,
@@ -926,26 +983,6 @@ class MultiTokenManager:
         self.persist_credentials()
         logger.info("已删除凭据 #%d", cid)
 
-    def get_load_balancing_mode(self) -> str:
-        with self._lock:
-            return self._load_balancing_mode
-
-    def set_load_balancing_mode(self, mode: str):
-        if mode not in ("priority", "balanced"):
-            raise ValueError(f"无效的负载均衡模式: {mode}")
-        with self._lock:
-            if self._load_balancing_mode == mode:
-                return
-            previous = self._load_balancing_mode
-            self._load_balancing_mode = mode
-        try:
-            self._persist_load_balancing_mode(mode)
-        except Exception:
-            with self._lock:
-                self._load_balancing_mode = previous
-            raise
-        logger.info("负载均衡模式已设置为: %s", mode)
-
     # ========================================================================
     # 持久化方法
     # ========================================================================
@@ -1042,15 +1079,48 @@ class MultiTokenManager:
         if should_flush:
             self.save_stats()
 
-    def _persist_load_balancing_mode(self, mode: str):
-        """持久化负载均衡模式到配置文件"""
-        config_path = self._config.config_path()
-        if not config_path:
-            logger.warning("配置文件路径未知，负载均衡模式仅在当前进程生效: %s", mode)
-            return
-        cfg = Config.load(str(config_path))
-        cfg.load_balancing_mode = mode
-        cfg.save()
+    def get_stats(self) -> dict:
+        """获取统计数据快照"""
+        now = time.time()
+        with self._lock:
+            cutoff = now - 60
+            self._request_timestamps = [t for t in self._request_timestamps if t > cutoff]
+            rpm = len(self._request_timestamps)
+            total_requests = sum(e.success_count for e in self._entries)
+            session_requests = sum(e.session_count for e in self._entries)
+            # 细粒度：{model: {cred_id_str: count}}
+            model_cred = {
+                m: {str(cid): cnt for cid, cnt in creds.items()}
+                for m, creds in self._model_cred_counts.items()
+            }
+            return {
+                "totalRequests": total_requests,
+                "sessionRequests": session_requests,
+                "rpm": rpm,
+                "peakRpm": self._peak_rpm,
+                "modelCounts": dict(self._model_call_counts),
+                "modelCredCounts": model_cred,
+                "credentialCount": len(self._entries),
+                "availableCount": sum(1 for e in self._entries if not e.disabled),
+            }
+
+    # ========================================================================
+    # 分组与路由
+    # ========================================================================
+
+    def update_groups(self, groups: dict[int, str]):
+        """从 AdminService 同步分组信息"""
+        with self._lock:
+            self._groups = dict(groups)
+
+    def update_free_models(self, models: set[str]):
+        """更新免费模型列表"""
+        with self._lock:
+            self._free_models = set(models)
+
+    def get_free_models(self) -> set[str]:
+        with self._lock:
+            return set(self._free_models)
 
     def __del__(self):
         if getattr(self, '_stats_dirty', False):

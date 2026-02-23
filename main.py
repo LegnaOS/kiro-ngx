@@ -22,6 +22,7 @@ from anthropic_api.router import create_router_with_provider
 from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middleware
 from admin import AdminService, AdminAuthMiddleware, create_admin_router
 from admin.ui_router import create_admin_ui_router
+from anthropic_api.message_log import init_message_logger
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -84,6 +85,10 @@ def main():
         sys.exit(1)
 
     kiro_provider = KiroProvider(token_manager=token_manager, proxy=proxy_config)
+
+    # 初始化消息日志
+    log_dir = Path(__file__).resolve().parent / "logs"
+    init_message_logger(log_dir)
 
     # 构建 FastAPI 应用
     app = FastAPI()
