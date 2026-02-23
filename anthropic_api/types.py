@@ -137,7 +137,7 @@ class MessagesRequest(BaseModel):
     max_tokens: int
     messages: List[Dict[str, Any]]
     stream: bool = False
-    system: Optional[List[Dict[str, str]]] = None
+    system: Optional[List[Dict[str, Any]]] = None
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
     thinking: Optional[Dict[str, Any]] = None
@@ -203,7 +203,7 @@ class MessagesRequest(BaseModel):
 class CountTokensRequest(BaseModel):
     model: str
     messages: List[Dict[str, Any]]
-    system: Optional[List[Dict[str, str]]] = None
+    system: Optional[List[Dict[str, Any]]] = None
     tools: Optional[List[Dict[str, Any]]] = None
 
     @field_validator("system", mode="before")
