@@ -114,7 +114,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setLoadingCommits(false)
   }
 
-  // 选择某个 commit 后走确认流程（含本地改动检测）
+  // 选择 commit 后检测本地改动
   const handleSelectCommit = async (hash?: string) => {
     setShowCommitPanel(false)
     setTargetCommit(hash)
@@ -129,9 +129,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   // badge 点击（更新到最新）也走确认
-  const handleBadgeClick = () => handleSelectCommit(undefined)
 
-  // 本地改动弹窗确认后继续
+  // 本地改动警告确认后继续
   const handleForceUpdate = () => {
     setLocalChangesWarning(null)
     setConfirmAction('update')
@@ -185,7 +184,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <span className="font-semibold">Kiro Admin</span>
               {versionInfo && <span className="text-xs text-muted-foreground">v{versionInfo.current}</span>}
               {versionInfo?.hasUpdate && (
-                <Badge variant="outline" className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950" onClick={handleBadgeClick}>
+                <Badge variant="outline" className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950" onClick={() => handleSelectCommit(undefined)}>
                   {versionInfo.latest !== 'unknown' && versionInfo.latest !== versionInfo.current
                     ? `v${versionInfo.latest} 可用`
                     : `${versionInfo.behindCount} 个新提交`}
@@ -323,7 +322,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
             <DialogTitle className="text-center">检测到本地改动</DialogTitle>
             <DialogDescription className="text-center">
-              更新时会自动 stash 这些改动，更新后恢复。如果冲突则可能丢失。
+              更新会丢弃以下本地改动，此操作不可恢复。
             </DialogDescription>
           </DialogHeader>
           {localChangesWarning && localChangesWarning.length > 0 && (
@@ -333,10 +332,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
           )}
           <DialogFooter className="flex gap-2 sm:justify-center">
             <Button variant="outline" onClick={() => { setLocalChangesWarning(null); setTargetCommit(undefined) }}>取消</Button>
-            <Button variant="destructive" onClick={handleForceUpdate}>继续更新</Button>
+            <Button variant="destructive" onClick={handleForceUpdate}>丢弃并更新</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
     </div>
   )
 }

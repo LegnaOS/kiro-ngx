@@ -558,9 +558,9 @@ async def update_and_restart(request: Request) -> JSONResponse:
         def _run():
             run_kw = dict(cwd=str(project_root), capture_output=True, text=True, encoding="utf-8", errors="replace")
 
-            # stash 已跟踪文件的本地改动（不含 untracked，避免 stash venv 等大目录）
-            _append_update_log("git stash ...")
-            subprocess.run(["git", "stash"], timeout=30, **run_kw)
+            # 丢弃本地改动
+            _append_update_log("丢弃本地改动 ...")
+            subprocess.run(["git", "checkout", "--", "."], timeout=30, **run_kw)
 
             if target_commit:
                 # 切换到指定 commit
@@ -581,9 +581,6 @@ async def update_and_restart(request: Request) -> JSONResponse:
                         _append_update_log(f"git reset 失败: {r.stderr.strip()}")
                         return False
                 _append_update_log("代码更新完成")
-
-            # stash pop（忽略错误）
-            subprocess.run(["git", "stash", "pop"], timeout=15, **run_kw)
 
             # npm build（可选）
             admin_ui = project_root / "admin-ui"
