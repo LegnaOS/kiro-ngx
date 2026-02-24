@@ -8,6 +8,12 @@ __pycache__/
 dist/
 !admin-ui/dist/
 *.egg
+venv/
+
+# 运行时
+kiro.log
+nohup.out
+kiro_token_usage.json
 
 # 敏感文件 - 不要提交实际凭据和配置
 credentials.json

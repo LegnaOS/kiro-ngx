@@ -558,9 +558,9 @@ async def update_and_restart(request: Request) -> JSONResponse:
         def _run():
             run_kw = dict(cwd=str(project_root), capture_output=True, text=True, encoding="utf-8", errors="replace")
 
-            # stash 本地改动
-            _append_update_log("git stash --include-untracked ...")
-            subprocess.run(["git", "stash", "--include-untracked"], timeout=30, **run_kw)
+            # stash 已跟踪文件的本地改动（不含 untracked，避免 stash venv 等大目录）
+            _append_update_log("git stash ...")
+            subprocess.run(["git", "stash"], timeout=30, **run_kw)
 
             if target_commit:
                 # 切换到指定 commit
@@ -571,16 +571,16 @@ async def update_and_restart(request: Request) -> JSONResponse:
                     return False
                 _append_update_log("git checkout 完成")
             else:
-                # git pull --ff-only，失败则 fallback
+                # git pull --ff-only，失败则 reset 到远程
                 _append_update_log("git pull --ff-only ...")
                 r = subprocess.run(["git", "pull", "--ff-only"], timeout=60, **run_kw)
                 if r.returncode != 0:
-                    _append_update_log(f"ff-only 失败 (rc={r.returncode})，尝试 git pull --no-edit ...")
-                    r = subprocess.run(["git", "pull", "--no-edit"], timeout=60, **run_kw)
+                    _append_update_log("ff-only 失败，reset 到 origin/master ...")
+                    r = subprocess.run(["git", "reset", "--hard", "origin/master"], timeout=30, **run_kw)
                     if r.returncode != 0:
-                        _append_update_log(f"git pull 失败: {r.stderr.strip()}")
+                        _append_update_log(f"git reset 失败: {r.stderr.strip()}")
                         return False
-                _append_update_log("git pull 完成")
+                _append_update_log("代码更新完成")
 
             # stash pop（忽略错误）
             subprocess.run(["git", "stash", "pop"], timeout=15, **run_kw)

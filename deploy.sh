@@ -5,9 +5,13 @@ cd "$(dirname "$0")"
 
 echo "=== Kiro.py 一键部署 ==="
 
-# 拉取最新代码
+# 拉取最新代码（自动处理本地冲突）
 echo "[1/4] 拉取最新代码..."
-git pull --ff-only
+git fetch origin
+if ! git pull --ff-only 2>/dev/null; then
+  echo "  ff-only 失败，重置到远程版本..."
+  git reset --hard origin/master
+fi
 
 # Python venv — 优先使用高版本 Python
 PYTHON_BIN=""
@@ -21,8 +25,10 @@ if [ -z "$PYTHON_BIN" ]; then
   echo "错误: 未找到 python3"; exit 1
 fi
 
-if [ ! -d "venv" ]; then
+# venv 损坏或不存在时自动重建
+if [ ! -f "venv/bin/activate" ]; then
   echo "[2/4] 创建虚拟环境 ($PYTHON_BIN)..."
+  rm -rf venv
   $PYTHON_BIN -m venv venv
 else
   echo "[2/4] 虚拟环境已存在"
@@ -30,7 +36,7 @@ fi
 source venv/bin/activate
 pip install -q -r requirements.txt
 
-# 构建前端（无 npm 则跳过，使用仓库中预编译的 admin-ui-dist）
+# 构建前端（无 npm 则跳过，使用仓库中预编译的 dist）
 if command -v npm &>/dev/null && [ -d "admin-ui" ]; then
   echo "[3/4] 构建前端..."
   cd admin-ui
