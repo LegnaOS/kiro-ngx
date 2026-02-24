@@ -636,9 +636,15 @@ async def get_request_stats(request: Request) -> JSONResponse:
 
 
 async def get_model_list(request: Request) -> JSONResponse:
-    """GET /models - 获取支持的模型列表"""
+    """GET /models - 获取支持的模型列表（内置 + 自定义）"""
     from anthropic_api.handlers import MODELS
-    models = [{"id": m.id, "displayName": m.display_name} for m in MODELS]
+    builtin_ids = {m.id for m in MODELS}
+    models = [{"id": m.id, "displayName": m.display_name, "custom": False} for m in MODELS]
+    # 追加自定义模型
+    service = request.app.state.admin_service
+    for mid in service.get_custom_models():
+        if mid not in builtin_ids:
+            models.append({"id": mid, "displayName": mid, "custom": True})
     return JSONResponse(content={"models": models})
 
 
@@ -646,7 +652,8 @@ async def get_routing_config(request: Request) -> JSONResponse:
     """GET /routing - 获取路由配置"""
     service = request.app.state.admin_service
     free_models = service.get_free_models()
-    return JSONResponse(content={"freeModels": free_models})
+    custom_models = service.get_custom_models()
+    return JSONResponse(content={"freeModels": free_models, "customModels": custom_models})
 
 
 async def set_routing_config(request: Request) -> JSONResponse:
@@ -656,6 +663,11 @@ async def set_routing_config(request: Request) -> JSONResponse:
     free_models = body.get("freeModels", [])
     if not isinstance(free_models, list):
         return JSONResponse(status_code=400, content={"success": False, "message": "freeModels 必须是数组"})
+    custom_models = body.get("customModels")
+    if custom_models is not None:
+        if not isinstance(custom_models, list):
+            return JSONResponse(status_code=400, content={"success": False, "message": "customModels 必须是数组"})
+        service.set_custom_models(custom_models)
     service.set_free_models(free_models)
     return JSONResponse(content=SuccessResponse.new(f"路由配置已更新（{len(free_models)} 个免费模型）").to_dict())
 

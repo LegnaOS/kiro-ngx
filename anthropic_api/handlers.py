@@ -81,9 +81,21 @@ MODELS = [
 ]
 
 
-async def get_models():
+async def get_models(request: Request):
     logger.info("Received GET /v1/models request")
-    return JSONResponse(content=ModelsResponse(data=MODELS).to_dict())
+    all_models = list(MODELS)
+    # 动态追加自定义模型（来自 admin 路由配置）
+    admin_svc = getattr(request.app.state, "admin_service", None)
+    if admin_svc:
+        builtin_ids = {m.id for m in MODELS}
+        for mid in admin_svc.get_custom_models():
+            if mid not in builtin_ids:
+                all_models.append(Model(
+                    id=mid, object="model", created=0,
+                    owned_by="custom", display_name=mid,
+                    type="chat", max_tokens=32000,
+                ))
+    return JSONResponse(content=ModelsResponse(data=all_models).to_dict())
 
 
 def _override_thinking_from_model_name(payload: MessagesRequest) -> None:

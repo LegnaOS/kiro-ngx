@@ -34,6 +34,7 @@ class AdminService:
         self._groups: dict[int, str] = {}  # {credential_id: "free"|"pro"|"priority"}
         self._groups_path: Optional[Path] = None
         self._routing_path: Optional[Path] = None
+        self._custom_models: list[str] = []
 
         cache_dir = getattr(token_manager, "cache_dir", None)
         if callable(cache_dir):
@@ -322,6 +323,7 @@ class AdminService:
             data = json.loads(self._routing_path.read_text(encoding="utf-8"))
             free_models = set(data.get("freeModels", []))
             self.token_manager.update_free_models(free_models)
+            self._custom_models = list(data.get("customModels", []))
         except Exception as e:
             logger.warning("解析路由配置失败，将忽略: %s", e)
 
@@ -332,7 +334,10 @@ class AdminService:
             free_models = sorted(self.token_manager.get_free_models())
             self._routing_path.parent.mkdir(parents=True, exist_ok=True)
             self._routing_path.write_text(
-                json.dumps({"freeModels": free_models}, indent=2, ensure_ascii=False),
+                json.dumps({
+                    "freeModels": free_models,
+                    "customModels": self._custom_models,
+                }, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
         except Exception as e:
@@ -343,6 +348,13 @@ class AdminService:
 
     def set_free_models(self, models: list[str]) -> None:
         self.token_manager.update_free_models(set(models))
+        self._save_routing()
+
+    def get_custom_models(self) -> list[str]:
+        return list(self._custom_models)
+
+    def set_custom_models(self, models: list[str]) -> None:
+        self._custom_models = list(models)
         self._save_routing()
 
     def get_stats(self) -> dict:

@@ -113,9 +113,11 @@ export interface RequestStats {
 export interface ModelInfo {
   id: string
   displayName: string
+  custom?: boolean
 }
 
 // 路由配置
 export interface RoutingConfig {
   freeModels: string[]
+  customModels?: string[]
 }
