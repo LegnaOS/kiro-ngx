@@ -70,7 +70,7 @@ def map_model(model: str) -> Optional[str]:
         return "claude-opus-4.5" if ("4-5" in m or "4.5" in m) else "claude-opus-4.6"
     elif "haiku" in m:
         return "claude-haiku-4.5"
-    return None
+    return model
 
 
 def normalize_json_schema(schema: Any) -> dict:
