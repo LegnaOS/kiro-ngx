@@ -48,10 +48,11 @@ def _map_provider_error(err: Exception):
 
 
 def _report_token_usage(model: str, input_tokens: int, output_tokens: int):
-    """向 TokenUsageTracker 上报一次请求的 token 用量"""
+    """向 TokenUsageTracker 上报一次请求的 token 用量（模型名归一化为 Kiro ID）"""
+    from anthropic_api.converter import map_model
     tracker = get_token_usage_tracker()
     if tracker:
-        tracker.report(model, input_tokens, output_tokens)
+        tracker.report(map_model(model) or model, input_tokens, output_tokens)
 
 
 # === 模型列表 ===

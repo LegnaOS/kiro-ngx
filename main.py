@@ -2,12 +2,10 @@
 
 import logging
 import os
-import platform
-import subprocess
 import sys
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from pathlib import Path
@@ -124,13 +122,6 @@ def main():
         admin_app = FastAPI()
         admin_app.include_router(admin_router)
         admin_app.state.admin_service = admin_service
-        # 重启端点直接注册到 admin_app，随 AdminAuthMiddleware 鉴权
-        @admin_app.post("/restart")
-        async def restart_server(request: Request):
-            import asyncio
-            asyncio.get_event_loop().call_later(1.0, _do_restart)
-            return JSONResponse(content={"success": True, "message": "正在重启..."})
-
         admin_app.add_middleware(AdminAuthMiddleware, admin_api_key=admin_key)
         app.mount("/api/admin", admin_app)
 
@@ -165,15 +156,6 @@ def main():
         logger.info("  GET  /admin")
 
     uvicorn.run(app, host=config.host, port=config.port, log_level="info")
-
-
-def _do_restart():
-    """跨平台重启进程"""
-    if platform.system() == "Windows":
-        subprocess.Popen([sys.executable] + sys.argv)
-        os._exit(0)
-    else:
-        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

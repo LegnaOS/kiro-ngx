@@ -316,7 +316,7 @@ def _read_version(source: str = "local") -> str:
         try:
             r = subprocess.run(
                 ["git", "show", "origin/master:VERSION"],
-                cwd=str(root), capture_output=True, text=True, timeout=10,
+                cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
             )
             if r.returncode == 0:
                 return r.stdout.strip()
@@ -326,7 +326,7 @@ def _read_version(source: str = "local") -> str:
 
 
 async def get_version_info(request: Request) -> JSONResponse:
-    """GET /version - 获取当前版本和远程最新版本"""
+    """GET /version - 获取当前版本、远程版本、commit 差异"""
     import asyncio
     import subprocess
     from pathlib import Path
@@ -341,31 +341,146 @@ async def get_version_info(request: Request) -> JSONResponse:
         try:
             subprocess.run(
                 ["git", "fetch", "origin", "--quiet"],
-                cwd=str(root), capture_output=True, text=True, timeout=15,
+                cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
         except Exception:
             pass
 
         latest = _read_version("remote")
-        has_update = current != "unknown" and latest != "unknown" and current != latest
+        version_changed = current != "unknown" and latest != "unknown" and current != latest
+
+        # 检查 commit 差异（即使 VERSION 没变也能发现新提交）
+        behind_count = 0
+        try:
+            r = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD..origin/master"],
+                cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+            )
+            if r.returncode == 0:
+                behind_count = int(r.stdout.strip())
+        except Exception:
+            pass
+
+        has_update = version_changed or behind_count > 0
 
         return {
             "current": current,
             "latest": latest,
             "hasUpdate": has_update,
+            "behindCount": behind_count,
         }
 
     result = await loop.run_in_executor(None, _fetch)
     return JSONResponse(content=result)
 
 
+async def get_git_status(request: Request) -> JSONResponse:
+    """GET /git/status - 检测本地是否有未提交改动"""
+    import asyncio
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    loop = asyncio.get_event_loop()
+
+    def _check():
+        has_changes = False
+        changed_files: list[str] = []
+        try:
+            r = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                has_changes = True
+                changed_files = [line.strip() for line in r.stdout.strip().splitlines()[:20]]
+        except Exception:
+            pass
+        return {"hasLocalChanges": has_changes, "changedFiles": changed_files}
+
+    result = await loop.run_in_executor(None, _check)
+    return JSONResponse(content=result)
+
+
+async def get_git_log(request: Request) -> JSONResponse:
+    """GET /git/log - 获取远程 commit 列表（含当前 HEAD 标记）"""
+    import asyncio
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    loop = asyncio.get_event_loop()
+
+    def _fetch():
+        run_kw = dict(cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+        # fetch 远程
+        try:
+            subprocess.run(["git", "fetch", "origin", "--quiet"], timeout=15, **run_kw)
+        except Exception:
+            pass
+
+        # 当前 HEAD commit hash
+        current_hash = ""
+        try:
+            r = subprocess.run(["git", "rev-parse", "HEAD"], timeout=5, **run_kw)
+            if r.returncode == 0:
+                current_hash = r.stdout.strip()
+        except Exception:
+            pass
+
+        # 远程 commit 列表（最近 30 条）
+        commits: list[dict] = []
+        try:
+            r = subprocess.run(
+                ["git", "log", "origin/master", "--pretty=format:%H|%h|%s|%ai", "-30"],
+                timeout=10, **run_kw,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                for line in r.stdout.strip().splitlines():
+                    parts = line.split("|", 3)
+                    if len(parts) == 4:
+                        commits.append({
+                            "hash": parts[0],
+                            "short": parts[1],
+                            "message": parts[2],
+                            "date": parts[3],
+                            "isCurrent": parts[0] == current_hash,
+                        })
+        except Exception:
+            pass
+
+        return {"currentHash": current_hash, "commits": commits}
+
+    result = await loop.run_in_executor(None, _fetch)
+    return JSONResponse(content=result)
+
+
 async def restart_server(request: Request) -> JSONResponse:
-    """POST /restart - 重启服务"""
+    """POST /restart - 重启服务（Windows 下先重新编译前端）"""
     import asyncio
     import subprocess
     import sys
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parent.parent
 
     async def _do_restart():
+        loop = asyncio.get_event_loop()
+
+        # Windows 开发环境：重启前重新编译前端
+        if platform.system() == "Windows" and _has_command("npm"):
+            admin_ui = project_root / "admin-ui"
+            if (admin_ui / "package.json").exists():
+                logger.info("[restart] npm run build ...")
+                r = await loop.run_in_executor(
+                    None, lambda: _npm_run(["npm", "run", "build"], str(admin_ui)),
+                )
+                if r.returncode == 0:
+                    logger.info("[restart] npm build 完成")
+                else:
+                    logger.warning("[restart] npm build 失败 (rc=%d): %s", r.returncode, r.stderr[:500])
+
         await asyncio.sleep(0.5)
         if platform.system() == "Windows":
             subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
@@ -377,65 +492,129 @@ async def restart_server(request: Request) -> JSONResponse:
     return JSONResponse(content={"success": True, "message": "正在重启..."})
 
 
+_update_log: list[str] = []
+"""更新过程实时日志，供前端轮询"""
+
+
+def _append_update_log(msg: str):
+    _update_log.append(msg)
+    logger.info("[update] %s", msg)
+
+
+def _find_venv_pip() -> str | None:
+    """查找 venv 中的 pip，兼容 Linux/Windows"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    candidates = [
+        root / "venv" / "bin" / "pip",
+        root / "venv" / "Scripts" / "pip.exe",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _has_command(name: str) -> bool:
+    import shutil
+    return shutil.which(name) is not None
+
+
+def _npm_run(args: list[str], cwd: str, timeout: int = 120) -> "subprocess.CompletedProcess":
+    """跨平台执行 npm 命令（Windows 需要 shell=True 才能找到 npm.cmd）"""
+    import subprocess
+    return subprocess.run(
+        args, cwd=cwd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=timeout,
+        shell=(platform.system() == "Windows"),
+    )
+
+
+async def get_update_status(request: Request) -> JSONResponse:
+    """GET /update/status - 获取更新进度日志"""
+    return JSONResponse(content={"log": list(_update_log)})
+
+
 async def update_and_restart(request: Request) -> JSONResponse:
-    """POST /update - 拉取最新代码、构建前端、重启服务"""
+    """POST /update - stash → pull/checkout → npm(可选) → pip → 重启"""
     import asyncio
     import subprocess
     import sys
     from pathlib import Path
 
-    project_root = Path(__file__).resolve().parent.parent
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    target_commit = body.get("targetCommit")
 
-    # 同步执行 git pull + npm build，收集输出
+    project_root = Path(__file__).resolve().parent.parent
+    _update_log.clear()
+
     async def _do_update():
         loop = asyncio.get_event_loop()
 
         def _run():
-            steps_log = []
+            run_kw = dict(cwd=str(project_root), capture_output=True, text=True, encoding="utf-8", errors="replace")
 
-            # git pull
-            r = subprocess.run(
-                ["git", "pull", "--ff-only"],
-                cwd=str(project_root), capture_output=True, text=True, timeout=60,
-            )
-            steps_log.append(f"[git pull] rc={r.returncode}\n{r.stdout}{r.stderr}")
-            if r.returncode != 0:
-                return False, "\n".join(steps_log)
+            # stash 本地改动
+            _append_update_log("git stash --include-untracked ...")
+            subprocess.run(["git", "stash", "--include-untracked"], timeout=30, **run_kw)
 
-            # npm install + build
-            admin_ui = project_root / "admin-ui"
-            if (admin_ui / "package.json").exists():
-                r = subprocess.run(
-                    ["npm", "install", "--silent"],
-                    cwd=str(admin_ui), capture_output=True, text=True, timeout=120,
-                )
-                steps_log.append(f"[npm install] rc={r.returncode}\n{r.stdout}{r.stderr}")
-
-                r = subprocess.run(
-                    ["npm", "run", "build"],
-                    cwd=str(admin_ui), capture_output=True, text=True, timeout=120,
-                )
-                steps_log.append(f"[npm build] rc={r.returncode}\n{r.stdout}{r.stderr}")
+            if target_commit:
+                # 切换到指定 commit
+                _append_update_log(f"git checkout {target_commit[:8]} ...")
+                r = subprocess.run(["git", "checkout", target_commit], timeout=30, **run_kw)
                 if r.returncode != 0:
-                    return False, "\n".join(steps_log)
+                    _append_update_log(f"git checkout 失败: {r.stderr.strip()}")
+                    return False
+                _append_update_log("git checkout 完成")
+            else:
+                # git pull --ff-only，失败则 fallback
+                _append_update_log("git pull --ff-only ...")
+                r = subprocess.run(["git", "pull", "--ff-only"], timeout=60, **run_kw)
+                if r.returncode != 0:
+                    _append_update_log(f"ff-only 失败 (rc={r.returncode})，尝试 git pull --no-edit ...")
+                    r = subprocess.run(["git", "pull", "--no-edit"], timeout=60, **run_kw)
+                    if r.returncode != 0:
+                        _append_update_log(f"git pull 失败: {r.stderr.strip()}")
+                        return False
+                _append_update_log("git pull 完成")
 
-            # pip install
-            venv_pip = project_root / "venv" / "bin" / "pip"
-            if venv_pip.exists():
-                r = subprocess.run(
-                    [str(venv_pip), "install", "-q", "-r", "requirements.txt"],
-                    cwd=str(project_root), capture_output=True, text=True, timeout=60,
+            # stash pop（忽略错误）
+            subprocess.run(["git", "stash", "pop"], timeout=15, **run_kw)
+
+            # npm build（可选）
+            admin_ui = project_root / "admin-ui"
+            if _has_command("npm") and (admin_ui / "package.json").exists():
+                _append_update_log("npm install ...")
+                _npm_run(["npm", "install", "--silent"], str(admin_ui))
+                _append_update_log("npm run build ...")
+                r = _npm_run(["npm", "run", "build"], str(admin_ui))
+                if r.returncode != 0:
+                    _append_update_log(f"npm build 失败 (rc={r.returncode})，使用已有 dist")
+            else:
+                _append_update_log("npm 不可用，跳过前端构建")
+
+            # pip install（可选）
+            venv_pip = _find_venv_pip()
+            if venv_pip:
+                _append_update_log("pip install -r requirements.txt ...")
+                subprocess.run(
+                    [venv_pip, "install", "-q", "-r", "requirements.txt"],
+                    timeout=60, **run_kw,
                 )
-                steps_log.append(f"[pip install] rc={r.returncode}\n{r.stdout}{r.stderr}")
+                _append_update_log("pip install 完成")
 
-            return True, "\n".join(steps_log)
+            return True
 
-        success, log = await loop.run_in_executor(None, _run)
+        success = await loop.run_in_executor(None, _run)
         if not success:
-            logger.error("更新失败:\n%s", log)
+            _append_update_log("更新失败，已中止")
             return
 
-        logger.info("更新完成，正在重启...\n%s", log)
+        _append_update_log("更新完成，正在重启...")
         await asyncio.sleep(0.5)
         if platform.system() == "Windows":
             subprocess.Popen([sys.executable] + sys.argv, close_fds=True)

@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Power, Download, Home, KeyRound, Settings, ScrollText, AlertTriangle } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Power, Home, KeyRound, Settings, ScrollText, AlertTriangle, GitBranch, Check } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -10,7 +10,11 @@ import {
   DialogTitle, DialogDescription,
 } from '@/components/ui/dialog'
 import { useCredentials } from '@/hooks/use-credentials'
-import { restartServer, updateAndRestart, getVersionInfo, getLogStatus, setLogStatus, type VersionInfo } from '@/api/credentials'
+import {
+  restartServer, updateAndRestart, getVersionInfo, getGitStatus,
+  getGitLog, getLogStatus, setLogStatus,
+  type VersionInfo, type GitCommit,
+} from '@/api/credentials'
 import { HomeTab } from '@/components/tabs/home-tab'
 import { CredentialsTab } from '@/components/tabs/credentials-tab'
 import { StrategyTab } from '@/components/tabs/strategy-tab'
@@ -35,6 +39,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
   const [logEnabled, setLogEnabled] = useState(false)
   const [confirmAction, setConfirmAction] = useState<'restart' | 'update' | null>(null)
+  const [localChangesWarning, setLocalChangesWarning] = useState<string[] | null>(null)
+  // commit 列表面板
+  const [showCommitPanel, setShowCommitPanel] = useState(false)
+  const [commits, setCommits] = useState<GitCommit[]>([])
+  const [loadingCommits, setLoadingCommits] = useState(false)
+  // 选中的目标 commit（用于确认弹窗）
+  const [targetCommit, setTargetCommit] = useState<string | undefined>(undefined)
+  const panelRef = useRef<HTMLDivElement>(null)
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
@@ -49,6 +61,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     getLogStatus().then(s => setLogEnabled(s.enabled)).catch(() => {})
   }, [])
+
+  // 点击面板外部关闭
+  useEffect(() => {
+    if (!showCommitPanel) return
+    const handler = (e: MouseEvent) => {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+        setShowCommitPanel(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showCommitPanel])
 
   const toggleDarkMode = () => { setDarkMode(!darkMode); document.documentElement.classList.toggle('dark') }
   const handleLogout = () => { storage.removeApiKey(); queryClient.clear(); onLogout() }
@@ -73,13 +97,54 @@ export function Dashboard({ onLogout }: DashboardProps) {
     refetch()
   }
 
+  // 打开 commit 列表面板
+  const handleToggleCommitPanel = async () => {
+    if (showCommitPanel) {
+      setShowCommitPanel(false)
+      return
+    }
+    setShowCommitPanel(true)
+    setLoadingCommits(true)
+    try {
+      const { commits: list } = await getGitLog()
+      setCommits(list)
+    } catch {
+      toast.error('获取版本列表失败')
+    }
+    setLoadingCommits(false)
+  }
+
+  // 选择某个 commit 后走确认流程（含本地改动检测）
+  const handleSelectCommit = async (hash?: string) => {
+    setShowCommitPanel(false)
+    setTargetCommit(hash)
+    try {
+      const git = await getGitStatus()
+      if (git.hasLocalChanges) {
+        setLocalChangesWarning(git.changedFiles)
+        return
+      }
+    } catch { /* 检测失败不阻塞 */ }
+    setConfirmAction('update')
+  }
+
+  // badge 点击（更新到最新）也走确认
+  const handleBadgeClick = () => handleSelectCommit(undefined)
+
+  // 本地改动弹窗确认后继续
+  const handleForceUpdate = () => {
+    setLocalChangesWarning(null)
+    setConfirmAction('update')
+  }
+
   const handleUpdate = async () => {
     setConfirmAction(null)
     setUpdating(true)
     toast.info('正在更新...')
-    const r = await updateAndRestart()
+    const r = await updateAndRestart((step) => { toast.info(step) }, targetCommit)
     setUpdating(false)
     r.success ? (toast.success(r.message), window.location.reload()) : toast.error(r.message)
+    setTargetCommit(undefined)
   }
 
   if (isLoading) {
@@ -113,15 +178,62 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 顶部导航 */}
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="container flex h-14 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3 min-w-0">
+            {/* 版本号 + commit 面板触发 */}
+            <div className="relative flex items-center gap-1.5 flex-shrink-0">
               <Server className="h-5 w-5" />
               <span className="font-semibold">Kiro Admin</span>
               {versionInfo && <span className="text-xs text-muted-foreground">v{versionInfo.current}</span>}
               {versionInfo?.hasUpdate && (
-                <Badge variant="outline" className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950" onClick={() => setConfirmAction('update')}>
-                  v{versionInfo.latest} 可用
+                <Badge variant="outline" className="text-xs cursor-pointer border-orange-400 text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950" onClick={handleBadgeClick}>
+                  {versionInfo.latest !== 'unknown' && versionInfo.latest !== versionInfo.current
+                    ? `v${versionInfo.latest} 可用`
+                    : `${versionInfo.behindCount} 个新提交`}
                 </Badge>
+              )}
+              <button
+                onClick={handleToggleCommitPanel}
+                disabled={updating || restarting}
+                className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                title="版本列表"
+              >
+                <GitBranch className={`h-4 w-4 ${loadingCommits ? 'animate-spin' : ''}`} />
+              </button>
+              {/* Commit 列表面板 */}
+              {showCommitPanel && (
+                <div ref={panelRef} className="absolute top-full left-0 mt-2 z-[60] w-96 max-h-80 overflow-y-auto rounded-lg border bg-popover shadow-lg">
+                  {loadingCommits ? (
+                    <div className="flex items-center justify-center py-8">
+                      <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-primary" />
+                    </div>
+                  ) : commits.length === 0 ? (
+                    <div className="py-6 text-center text-sm text-muted-foreground">无法获取版本列表</div>
+                  ) : (
+                    <div className="py-1">
+                      {commits.map(c => (
+                        <button
+                          key={c.hash}
+                          onClick={() => c.isCurrent ? setShowCommitPanel(false) : handleSelectCommit(c.hash)}
+                          className={`w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors flex items-start gap-2 ${c.isCurrent ? 'bg-primary/5' : ''}`}
+                        >
+                          <div className="flex-shrink-0 mt-0.5">
+                            {c.isCurrent
+                              ? <Check className="h-3.5 w-3.5 text-green-500" />
+                              : <GitBranch className="h-3.5 w-3.5 text-muted-foreground" />}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-xs text-muted-foreground">{c.short}</span>
+                              {c.isCurrent && <span className="text-[10px] text-green-600 font-medium">当前</span>}
+                            </div>
+                            <div className="truncate text-foreground">{c.message}</div>
+                            <div className="text-xs text-muted-foreground">{c.date.split(' ').slice(0, 2).join(' ')}</div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
             {/* Tab 切换 */}
@@ -142,29 +254,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
               ))}
             </nav>
           </div>
-          <div className="flex items-center gap-1">
-            <Button variant="ghost" size="icon" onClick={handleToggleLog} title={logEnabled ? '关闭消息日志' : '开启消息日志'}>
-              <ScrollText className={`h-5 w-5 ${logEnabled ? 'text-green-500' : ''}`} />
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <Button variant="ghost" size="sm" className="gap-1" onClick={handleToggleLog}>
+              <ScrollText className={`h-4 w-4 ${logEnabled ? 'text-green-500' : ''}`} />
+              <span className="text-xs">{logEnabled ? '日志开' : '日志关'}</span>
             </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
-              {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+            <Button variant="ghost" size="sm" className="gap-1" onClick={toggleDarkMode}>
+              {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+              <span className="text-xs">{darkMode ? '浅色' : '深色'}</span>
             </Button>
-            <Button variant="ghost" size="icon" onClick={() => setConfirmAction('update')} disabled={updating || restarting} title="更新">
-              <Download className={`h-5 w-5 ${updating ? 'animate-bounce' : versionInfo?.hasUpdate ? 'text-orange-500' : ''}`} />
+            <Button variant="ghost" size="sm" className="gap-1" onClick={() => setConfirmAction('restart')} disabled={restarting || updating}>
+              <Power className={`h-4 w-4 ${restarting ? 'animate-spin' : ''}`} />
+              <span className="text-xs">重启</span>
             </Button>
-            <Button variant="ghost" size="icon" onClick={() => setConfirmAction('restart')} disabled={restarting || updating} title="重启">
-              <Power className={`h-5 w-5 ${restarting ? 'animate-spin' : ''}`} />
+            <Button variant="ghost" size="sm" className="gap-1" onClick={handleRefresh}>
+              <RefreshCw className="h-4 w-4" />
+              <span className="text-xs">刷新</span>
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
-              <RefreshCw className="h-5 w-5" />
-            </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
-              <LogOut className="h-5 w-5" />
+            <Button variant="ghost" size="sm" className="gap-1" onClick={handleLogout}>
+              <LogOut className="h-4 w-4" />
+              <span className="text-xs">退出</span>
             </Button>
           </div>
         </div>
       </header>
-
       {/* Tab 内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
         {activeTab === 'home' && (
@@ -187,17 +300,40 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <DialogDescription className="text-center">
               {confirmAction === 'restart'
                 ? '重启期间所有连接将中断，正在进行的请求会丢失。确定继续吗？'
-                : '将从远程拉取最新版本并重启服务器，期间服务不可用。确定继续吗？'}
+                : targetCommit
+                  ? `将切换到 commit ${targetCommit.slice(0, 8)} 并重启服务器，期间服务不可用。确定继续吗？`
+                  : '将从远程拉取最新版本并重启服务器，期间服务不可用。确定继续吗？'}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="flex gap-2 sm:justify-center">
-            <Button variant="outline" onClick={() => setConfirmAction(null)}>取消</Button>
-            <Button
-              variant="destructive"
-              onClick={confirmAction === 'restart' ? handleRestart : handleUpdate}
-            >
+            <Button variant="outline" onClick={() => { setConfirmAction(null); setTargetCommit(undefined) }}>取消</Button>
+            <Button variant="destructive" onClick={confirmAction === 'restart' ? handleRestart : handleUpdate}>
               {confirmAction === 'restart' ? '重启' : '更新并重启'}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 本地改动警告弹窗 */}
+      <Dialog open={localChangesWarning !== null} onOpenChange={open => { if (!open) { setLocalChangesWarning(null); setTargetCommit(undefined) } }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-full bg-orange-100 dark:bg-orange-900/30">
+              <AlertTriangle className="h-6 w-6 text-orange-500" />
+            </div>
+            <DialogTitle className="text-center">检测到本地改动</DialogTitle>
+            <DialogDescription className="text-center">
+              更新时会自动 stash 这些改动，更新后恢复。如果冲突则可能丢失。
+            </DialogDescription>
+          </DialogHeader>
+          {localChangesWarning && localChangesWarning.length > 0 && (
+            <div className="max-h-40 overflow-y-auto rounded-md bg-muted p-2 text-xs font-mono">
+              {localChangesWarning.map((f, i) => <div key={i}>{f}</div>)}
+            </div>
+          )}
+          <DialogFooter className="flex gap-2 sm:justify-center">
+            <Button variant="outline" onClick={() => { setLocalChangesWarning(null); setTargetCommit(undefined) }}>取消</Button>
+            <Button variant="destructive" onClick={handleForceUpdate}>继续更新</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

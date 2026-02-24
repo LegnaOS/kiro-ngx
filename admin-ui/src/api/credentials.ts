@@ -117,10 +117,36 @@ export interface VersionInfo {
   current: string
   latest: string
   hasUpdate: boolean
+  behindCount: number
 }
 
 export async function getVersionInfo(): Promise<VersionInfo> {
   const { data } = await api.get<VersionInfo>('/version')
+  return data
+}
+
+// Git 状态
+export interface GitStatus {
+  hasLocalChanges: boolean
+  changedFiles: string[]
+}
+
+export async function getGitStatus(): Promise<GitStatus> {
+  const { data } = await api.get<GitStatus>('/git/status')
+  return data
+}
+
+// Git commit 列表
+export interface GitCommit {
+  hash: string
+  short: string
+  message: string
+  date: string
+  isCurrent: boolean
+}
+
+export async function getGitLog(): Promise<{ currentHash: string; commits: GitCommit[] }> {
+  const { data } = await api.get<{ currentHash: string; commits: GitCommit[] }>('/git/log')
   return data
 }
 
@@ -179,23 +205,60 @@ export async function restartServer(): Promise<{ success: boolean; message: stri
   return { success: false, message: '服务重启超时，请手动检查' }
 }
 
-// 拉取更新并重启（git pull + build + restart）
-export async function updateAndRestart(): Promise<{ success: boolean; message: string }> {
+// 获取更新进度日志
+export async function getUpdateStatus(): Promise<{ log: string[] }> {
+  const { data } = await api.get<{ log: string[] }>('/update/status')
+  return data
+}
+
+// 拉取更新并重启（git pull + build + restart），支持进度回调和指定 commit
+export async function updateAndRestart(
+  onProgress?: (step: string) => void,
+  targetCommit?: string,
+): Promise<{ success: boolean; message: string }> {
   try {
-    await api.post('/update')
+    await api.post('/update', targetCommit ? { targetCommit } : {})
   } catch {
     // 更新重启导致连接断开是正常的
   }
+
+  let lastLogLen = 0
   const maxAttempts = 120
   const interval = 2000
+
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(r => setTimeout(r, interval))
+
+    // 轮询进度日志
     try {
-      await api.get('/credentials')
-      return { success: true, message: '更新并重启成功' }
+      const { log } = await getUpdateStatus()
+      if (log.length > lastLogLen) {
+        for (let j = lastLogLen; j < log.length; j++) {
+          onProgress?.(log[j])
+        }
+        lastLogLen = log.length
+      }
+      // 如果日志包含失败标记，提前返回
+      const last = log[log.length - 1] ?? ''
+      if (last.includes('失败') && last.includes('中止')) {
+        return { success: false, message: log.join('\n') }
+      }
     } catch {
-      // 服务尚未恢复
+      // 服务可能已重启，尝试检测恢复
+      try {
+        await api.get('/credentials')
+        return { success: true, message: '更新并重启成功' }
+      } catch {
+        // 服务尚未恢复
+      }
     }
   }
-  return { success: false, message: '更新重启超时，请手动检查' }
+
+  // 超时，返回最后的日志作为错误信息
+  try {
+    const { log } = await getUpdateStatus()
+    return { success: false, message: `更新超时\n${log.join('\n')}` }
+  } catch {
+    return { success: false, message: '更新重启超时，请手动检查' }
+  }
 }

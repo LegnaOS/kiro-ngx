@@ -41,9 +41,17 @@ else
   echo "[3/4] 跳过前端构建（使用预编译版本）"
 fi
 
-# 停止旧进程并启动
+# 停止旧进程并启动（兼容 CentOS/Ubuntu：优先 ss → fuser → lsof）
 echo "[4/4] 启动服务..."
-PID=$(lsof -ti :${PORT:-8990} 2>/dev/null || true)
+TARGET_PORT=${PORT:-8990}
+PID=""
+if command -v ss &>/dev/null; then
+  PID=$(ss -tlnp "sport = :$TARGET_PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)
+elif command -v fuser &>/dev/null; then
+  PID=$(fuser "$TARGET_PORT/tcp" 2>/dev/null | tr -d ' ')
+elif command -v lsof &>/dev/null; then
+  PID=$(lsof -ti :"$TARGET_PORT" 2>/dev/null || true)
+fi
 if [ -n "$PID" ]; then
   echo "停止旧进程 (PID: $PID)..."
   kill $PID 2>/dev/null || true
