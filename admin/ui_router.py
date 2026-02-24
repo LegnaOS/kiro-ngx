@@ -6,10 +6,9 @@ from pathlib import Path
 from fastapi import APIRouter
 from fastapi.responses import Response
 
-# admin-ui 构建产物目录（优先 admin-ui/dist，回退到预编译的 admin-ui-dist）
+# admin-ui 构建产物目录
 _root = Path(__file__).resolve().parent.parent
-_dev_dist = _root / "admin-ui" / "dist"
-ADMIN_UI_DIST = _dev_dist if _dev_dist.is_dir() else _root / "admin-ui-dist"
+ADMIN_UI_DIST = _root / "admin-ui" / "dist"
 
 
 def create_admin_ui_router() -> APIRouter:

@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
+!admin-ui/dist/
 *.egg
 
 # 敏感文件 - 不要提交实际凭据和配置
@@ -21,7 +22,7 @@ logs/
 
 # Node / 前端
 admin-ui/node_modules/
-admin-ui/dist/
+admin-ui-dist/
 admin-ui/tsconfig.tsbuildinfo
 admin-ui/pnpm-lock.yaml
 
