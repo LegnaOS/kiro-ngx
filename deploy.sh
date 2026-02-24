@@ -36,16 +36,8 @@ fi
 source venv/bin/activate
 pip install -q -r requirements.txt
 
-# 构建前端（无 npm 则跳过，使用仓库中预编译的 dist）
-if command -v npm &>/dev/null && [ -d "admin-ui" ]; then
-  echo "[3/4] 构建前端..."
-  cd admin-ui
-  npm install --silent
-  npm run build
-  cd ..
-else
-  echo "[3/4] 跳过前端构建（使用预编译版本）"
-fi
+# 前端：Linux 直接使用仓库预编译的 dist，不构建
+echo "[3/4] 使用预编译前端"
 
 # 停止旧进程并启动（兼容 CentOS/Ubuntu：优先 ss → fuser → lsof）
 echo "[4/4] 启动服务..."
