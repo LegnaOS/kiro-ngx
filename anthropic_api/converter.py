@@ -74,35 +74,40 @@ def map_model(model: str) -> Optional[str]:
 
 
 def normalize_json_schema(schema: Any) -> dict:
-    """递归规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题"""
+    """白名单策略：只保留 Kiro API 支持的 JSON Schema 字段，删除可能导致错误的字段"""
     if not isinstance(schema, dict):
-        return {"type": "object", "properties": {}, "required": [], "additionalProperties": True}
-    obj = dict(schema)
-    # type 缺失时默认 object
-    if not isinstance(obj.get("type"), str) or not obj["type"]:
-        obj["type"] = "object"
-    is_obj = obj["type"] == "object" or "properties" in obj
-    if is_obj:
-        if not isinstance(obj.get("properties"), dict):
-            obj["properties"] = {}
-        else:
-            obj["properties"] = {
+        return {"type": "object", "properties": {}}
+
+    # Kiro API 支持的字段白名单（参考 AIClient-2-API 策略）
+    ALLOWED_KEYS = {"type", "description", "properties", "required", "enum", "items", "nullable"}
+
+    result = {}
+    for key, value in schema.items():
+        if key not in ALLOWED_KEYS:
+            continue  # 删除不支持的字段（$schema, additionalProperties, format, pattern, minimum, maximum 等）
+
+        if key == "properties" and isinstance(value, dict):
+            # 递归处理每个属性的子 schema
+            result[key] = {
                 k: normalize_json_schema(v) if isinstance(v, dict) else v
-                for k, v in obj["properties"].items()
+                for k, v in value.items()
             }
-        req = obj.get("required")
-        if isinstance(req, list):
-            obj["required"] = [r for r in req if isinstance(r, str)]
+        elif key == "items" and isinstance(value, dict):
+            # 递归处理数组元素的子 schema
+            result[key] = normalize_json_schema(value)
+        elif key == "required" and isinstance(value, list):
+            # 确保 required 只包含字符串
+            result[key] = [r for r in value if isinstance(r, str)]
         else:
-            obj["required"] = []
-        ap = obj.get("additionalProperties")
-        if not isinstance(ap, (bool, dict)):
-            obj["additionalProperties"] = True
-    # 递归处理 items（数组元素的子 schema）
-    items = obj.get("items")
-    if isinstance(items, dict):
-        obj["items"] = normalize_json_schema(items)
-    return obj
+            result[key] = value
+
+    # 确保基本字段存在
+    if "type" not in result:
+        result["type"] = "object"
+    if result.get("type") == "object" and "properties" not in result:
+        result["properties"] = {}
+
+    return result
 
 
 def _extract_session_id(user_id: str) -> Optional[str]:
