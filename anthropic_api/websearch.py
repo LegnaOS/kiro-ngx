@@ -7,6 +7,7 @@ import string
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi.responses import StreamingResponse
@@ -85,6 +86,7 @@ class WebSearchResult:
     title: str
     url: str
     snippet: Optional[str] = None
+    published_date: Optional[int] = None  # 毫秒时间戳
 
 @dataclass
 class WebSearchResults:
@@ -193,7 +195,8 @@ def parse_search_results(mcp_response: McpResponse) -> Optional[WebSearchResults
         return None
     try:
         data = json.loads(content.text)
-        results = [WebSearchResult(title=r["title"], url=r["url"], snippet=r.get("snippet"))
+        results = [WebSearchResult(title=r["title"], url=r["url"], snippet=r.get("snippet"),
+                                    published_date=r.get("publishedDate"))
                    for r in data.get("results", [])]
         return WebSearchResults(results=results, total_results=data.get("totalResults"), query=data.get("query"))
     except (json.JSONDecodeError, KeyError):
@@ -215,6 +218,28 @@ def _generate_search_summary(query: str, results: Optional[WebSearchResults]) ->
     return summary
 
 
+def _format_page_age(ms: Optional[int]) -> Optional[str]:
+    """毫秒时间戳 → 'February 25, 2026' 格式"""
+    if ms is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        # 跨平台：避免 %-d（Linux）/ %#d（Windows）差异
+        return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+    except (OSError, ValueError):
+        return None
+
+
+def _build_search_content(search_results: Optional[WebSearchResults]) -> list:
+    """构建 web_search_tool_result 的 content 数组"""
+    if not search_results:
+        return []
+    return [{"type": "web_search_result", "title": r.title, "url": r.url,
+             "encrypted_content": r.snippet or "",
+             "page_age": _format_page_age(r.published_date)}
+            for r in search_results.results]
+
+
 def _generate_websearch_events(
     model: str, query: str, tool_use_id: str,
     search_results: Optional[WebSearchResults], input_tokens: int,
@@ -222,37 +247,47 @@ def _generate_websearch_events(
     events: List[SseEvent] = []
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+    # 1. message_start
     events.append(SseEvent("message_start", {
         "type": "message_start", "message": {
             "id": message_id, "type": "message", "role": "assistant",
-            "model": model, "content": [], "stop_reason": None, "stop_sequence": None,
+            "model": model, "content": [], "stop_reason": None,
             "usage": {"input_tokens": input_tokens, "output_tokens": 0,
                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         },
     }))
+
+    # 2. text 决策块 (index 0)
+    decision_text = f'I\'ll search for "{query}".'
     events.append(SseEvent("content_block_start", {
         "type": "content_block_start", "index": 0,
-        "content_block": {"id": tool_use_id, "type": "server_tool_use", "name": "web_search", "input": {}},
+        "content_block": {"type": "text", "text": ""},
     }))
     events.append(SseEvent("content_block_delta", {
         "type": "content_block_delta", "index": 0,
-        "delta": {"type": "input_json_delta", "partial_json": json.dumps({"query": query}, ensure_ascii=False)},
+        "delta": {"type": "text_delta", "text": decision_text},
     }))
     events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": 0}))
 
-    search_content = []
-    if search_results:
-        search_content = [{"type": "web_search_result", "title": r.title, "url": r.url,
-                           "encrypted_content": r.snippet or "", "page_age": None}
-                          for r in search_results.results]
+    # 3. server_tool_use (index 1) — input 完整发送
     events.append(SseEvent("content_block_start", {
         "type": "content_block_start", "index": 1,
-        "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": search_content},
+        "content_block": {"id": tool_use_id, "type": "server_tool_use",
+                          "name": "web_search", "input": {"query": query}},
     }))
     events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": 1}))
 
+    # 4. web_search_tool_result (index 2)
     events.append(SseEvent("content_block_start", {
         "type": "content_block_start", "index": 2,
+        "content_block": {"type": "web_search_tool_result",
+                          "content": _build_search_content(search_results)},
+    }))
+    events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": 2}))
+
+    # 5. text 摘要块 (index 3)
+    events.append(SseEvent("content_block_start", {
+        "type": "content_block_start", "index": 3,
         "content_block": {"type": "text", "text": ""},
     }))
     summary = _generate_search_summary(query, search_results)
@@ -260,16 +295,18 @@ def _generate_websearch_events(
     for ci in range(0, len(summary), chunk_size):
         chunk = summary[ci:ci + chunk_size]
         events.append(SseEvent("content_block_delta", {
-            "type": "content_block_delta", "index": 2,
+            "type": "content_block_delta", "index": 3,
             "delta": {"type": "text_delta", "text": chunk},
         }))
-    events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": 2}))
+    events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": 3}))
 
+    # 6. message_delta + message_stop
     output_tokens = (len(summary) + 3) // 4
     events.append(SseEvent("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": output_tokens,
+                  "server_tool_use": {"web_search_requests": 1}},
     }))
     events.append(SseEvent("message_stop", {"type": "message_stop"}))
     return events
@@ -328,26 +365,22 @@ def _build_websearch_json_response(
     summary = _generate_search_summary(query, search_results)
     output_tokens = (len(summary) + 3) // 4
 
-    search_content = []
-    if search_results:
-        search_content = [{"type": "web_search_result", "title": r.title, "url": r.url,
-                           "encrypted_content": r.snippet or "", "page_age": None}
-                          for r in search_results.results]
-
     content = [
+        {"type": "text", "text": f'I\'ll search for "{query}".'},
         {"id": tool_use_id, "type": "server_tool_use", "name": "web_search",
          "input": {"query": query}},
-        {"type": "web_search_tool_result", "tool_use_id": tool_use_id,
-         "content": search_content},
+        {"type": "web_search_tool_result",
+         "content": _build_search_content(search_results)},
         {"type": "text", "text": summary},
     ]
 
     return JSONResponse(content={
         "id": message_id, "type": "message", "role": "assistant",
         "model": model, "content": content,
-        "stop_reason": "end_turn", "stop_sequence": None,
+        "stop_reason": "end_turn",
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
-                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                  "server_tool_use": {"web_search_requests": 1}},
     })
 
 
@@ -379,29 +412,21 @@ def generate_web_search_result_events(
     """生成 server_tool_use + web_search_tool_result 的 SSE 事件块"""
     events: List[SseEvent] = []
 
-    # server_tool_use 块
+    # server_tool_use — input 完整发送
     events.append(SseEvent("content_block_start", {
         "type": "content_block_start", "index": start_index,
         "content_block": {
             "id": tool_use_id, "type": "server_tool_use",
-            "name": "web_search", "input": {},
+            "name": "web_search", "input": {"query": query},
         },
-    }))
-    events.append(SseEvent("content_block_delta", {
-        "type": "content_block_delta", "index": start_index,
-        "delta": {"type": "input_json_delta", "partial_json": json.dumps({"query": query}, ensure_ascii=False)},
     }))
     events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": start_index}))
 
-    # web_search_tool_result 块
-    search_content = []
-    if search_results:
-        search_content = [{"type": "web_search_result", "title": r.title, "url": r.url,
-                           "encrypted_content": r.snippet or "", "page_age": None}
-                          for r in search_results.results]
+    # web_search_tool_result
     events.append(SseEvent("content_block_start", {
         "type": "content_block_start", "index": start_index + 1,
-        "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": search_content},
+        "content_block": {"type": "web_search_tool_result",
+                          "content": _build_search_content(search_results)},
     }))
     events.append(SseEvent("content_block_stop", {"type": "content_block_stop", "index": start_index + 1}))
 

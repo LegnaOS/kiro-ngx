@@ -74,22 +74,34 @@ def map_model(model: str) -> Optional[str]:
 
 
 def normalize_json_schema(schema: Any) -> dict:
-    """规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题"""
+    """递归规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题"""
     if not isinstance(schema, dict):
         return {"type": "object", "properties": {}, "required": [], "additionalProperties": True}
     obj = dict(schema)
+    # type 缺失时默认 object
     if not isinstance(obj.get("type"), str) or not obj["type"]:
         obj["type"] = "object"
-    if not isinstance(obj.get("properties"), dict):
-        obj["properties"] = {}
-    req = obj.get("required")
-    if isinstance(req, list):
-        obj["required"] = [r for r in req if isinstance(r, str)]
-    else:
-        obj["required"] = []
-    ap = obj.get("additionalProperties")
-    if not isinstance(ap, (bool, dict)):
-        obj["additionalProperties"] = True
+    is_obj = obj["type"] == "object" or "properties" in obj
+    if is_obj:
+        if not isinstance(obj.get("properties"), dict):
+            obj["properties"] = {}
+        else:
+            obj["properties"] = {
+                k: normalize_json_schema(v) if isinstance(v, dict) else v
+                for k, v in obj["properties"].items()
+            }
+        req = obj.get("required")
+        if isinstance(req, list):
+            obj["required"] = [r for r in req if isinstance(r, str)]
+        else:
+            obj["required"] = []
+        ap = obj.get("additionalProperties")
+        if not isinstance(ap, (bool, dict)):
+            obj["additionalProperties"] = True
+    # 递归处理 items（数组元素的子 schema）
+    items = obj.get("items")
+    if isinstance(items, dict):
+        obj["items"] = normalize_json_schema(items)
     return obj
 
 

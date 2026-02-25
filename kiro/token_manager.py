@@ -981,6 +981,8 @@ class MultiTokenManager:
                 logger.info("所有凭据已删除，current_id 已重置为 0")
 
         self.persist_credentials()
+        # 立即回写统计数据，清除已删除凭据的残留条目
+        self.save_stats()
         logger.info("已删除凭据 #%d", cid)
 
     # ========================================================================
