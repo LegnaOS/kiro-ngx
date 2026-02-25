@@ -25,6 +25,7 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   subscriptionTitle: string | null
   group: 'free' | 'pro' | 'priority' | null
+  balanceScore: number | null  // 动态均衡评分（越低越优先）
 }
 
 // 余额响应

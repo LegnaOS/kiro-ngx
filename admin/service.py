@@ -52,6 +52,8 @@ class AdminService:
         """获取所有凭据状态"""
         snapshot = self.token_manager.snapshot()
         credentials = []
+        now = time.time()
+
         for entry in snapshot.entries:
             # 自动分组：FREE → free，其他 → pro（除非手动设为 priority）
             sub_title = entry.subscription_title
@@ -63,6 +65,27 @@ class AdminService:
                 group = saved_group
             else:
                 group = "pro"
+
+            # 计算动态均衡评分（调用 token_manager 的评分方法）
+            balance_score = None
+            if not entry.disabled:
+                try:
+                    # 构造一个临时的 _CredentialEntry 对象用于评分计算
+                    from kiro.token_manager import _CredentialEntry
+                    temp_entry = _CredentialEntry(
+                        id=entry.id,
+                        credentials=None,  # 评分不需要 credentials 对象
+                        priority=entry.priority,
+                        disabled=entry.disabled,
+                        failure_count=entry.failure_count,
+                        success_count=entry.success_count,
+                        session_count=entry.session_count,
+                        last_used_at=entry.last_used_at,
+                        disabled_reason=None,
+                    )
+                    balance_score = self.token_manager._calculate_credential_score(temp_entry, now)
+                except Exception as e:
+                    logger.debug(f"计算凭据 #{entry.id} 评分失败: {e}")
 
             credentials.append(CredentialStatusItem(
                 id=entry.id,
@@ -82,6 +105,7 @@ class AdminService:
                 proxy_url=entry.proxy_url,
                 subscription_title=sub_title,
                 group=group,
+                balance_score=balance_score,
             ))
         credentials.sort(key=lambda c: c.priority)
         # 同步分组到 token_manager 用于路由

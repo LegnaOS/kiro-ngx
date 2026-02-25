@@ -26,6 +26,7 @@ class CredentialStatusItem:
     proxy_url: Optional[str] = None
     subscription_title: Optional[str] = None
     group: Optional[str] = None  # "free" | "pro" | "priority"
+    balance_score: Optional[float] = None  # 动态均衡评分（越低越优先）
 
     def to_dict(self) -> dict:
         d = {
@@ -45,6 +46,7 @@ class CredentialStatusItem:
             "hasProxy": self.has_proxy,
             "subscriptionTitle": self.subscription_title,
             "group": self.group,
+            "balanceScore": self.balance_score,
         }
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url

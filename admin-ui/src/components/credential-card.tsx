@@ -161,6 +161,27 @@ export function CredentialCard({
         <CardContent className="space-y-4">
           {/* 信息网格 */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+            {/* 均衡评分 - 新增，优先显示 */}
+            {credential.balanceScore !== null && credential.balanceScore !== undefined && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">均衡评分：</span>
+                <span className="font-medium ml-1">
+                  {credential.balanceScore.toFixed(1)}
+                  <span className="text-xs text-muted-foreground ml-1">
+                    (越低越优先)
+                  </span>
+                </span>
+                {/* 评分可视化条 */}
+                <div className="mt-1 h-2 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-green-500 via-yellow-500 to-red-500 transition-all"
+                    style={{
+                      width: `${Math.min(100, Math.max(0, (credential.balanceScore + 1000) / 20))}%`
+                    }}
+                  />
+                </div>
+              </div>
+            )}
             <div>
               <span className="text-muted-foreground">优先级：</span>
               {editingPriority ? (
