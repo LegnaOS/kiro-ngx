@@ -560,7 +560,7 @@ class MultiTokenManager:
                     return True
         return False
 
-    def _calculate_credential_score(self, entry: CredentialEntry, now: float) -> float:
+    def _calculate_credential_score(self, entry: "_CredentialEntry", now: float) -> float:
         """计算凭据评分（参考 AIClient-2-API 的动态均衡策略）
 
         评分 = 时间因子 - 负载因子
