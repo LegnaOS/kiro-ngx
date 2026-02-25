@@ -560,8 +560,34 @@ class MultiTokenManager:
                     return True
         return False
 
+    def _calculate_credential_score(self, entry: CredentialEntry, now: float) -> float:
+        """计算凭据评分（参考 AIClient-2-API 的动态均衡策略）
+
+        评分 = 时间因子 - 负载因子
+        - 时间因子：距离上次使用的秒数（越久未用分数越低，优先选择）
+        - 负载因子：使用次数 * 10（使用越多分数越高，避免过载）
+
+        返回值越小越优先选择
+        """
+        # 时间因子：距离上次使用的秒数
+        if entry.last_used_at:
+            try:
+                last_used_ts = datetime.fromisoformat(entry.last_used_at.replace('Z', '+00:00')).timestamp()
+                time_since_last_use = now - last_used_ts
+            except (ValueError, AttributeError):
+                time_since_last_use = 0
+        else:
+            time_since_last_use = now  # 从未使用过，时间因子最大
+
+        # 负载因子：使用次数惩罚（乘以 10 增加权重）
+        load_penalty = entry.session_count * 10
+
+        # 评分 = 时间差（秒）- 负载惩罚
+        # 结果：越久未用且使用次数少的凭据，分数越低（越优先）
+        return time_since_last_use - load_penalty
+
     def _select_next_credential(self, model: Optional[str] = None) -> Optional[tuple[int, KiroCredentials]]:
-        """根据负载均衡 + 分组路由选择下一个凭据（需在 _lock 内调用）"""
+        """根据动态均衡 + 分组路由选择下一个凭据（需在 _lock 内调用）"""
         is_opus = model and "opus" in model.lower() if model else False
 
         available = [
@@ -576,7 +602,13 @@ class MultiTokenManager:
             if self._model_is_free(model):
                 free_creds = [e for e in available if self._groups.get(e.id) == "free"]
                 if free_creds:
-                    entry = min(free_creds, key=lambda e: (e.session_count, e.credentials.priority))
+                    # 使用评分系统选择 free 组凭据
+                    now = time.time()
+                    entry = min(free_creds, key=lambda e: (
+                        self._calculate_credential_score(e, now),
+                        e.credentials.priority,
+                        e.id  # UUID 排序确保确定性
+                    ))
                     logger.debug("模型 %s 路由到 free 组凭据 #%d", model, entry.id)
                     return (entry.id, entry.credentials.clone())
                 # free 组耗尽，回退到 pro/priority
@@ -586,8 +618,13 @@ class MultiTokenManager:
                 if non_free:
                     available = non_free
 
-        # Least-Used 负载均衡
-        entry = min(available, key=lambda e: (e.session_count, e.credentials.priority))
+        # 动态均衡：LRU + 负载均衡 + 优先级
+        now = time.time()
+        entry = min(available, key=lambda e: (
+            self._calculate_credential_score(e, now),
+            e.credentials.priority,
+            e.id  # UUID 排序确保确定性
+        ))
         return (entry.id, entry.credentials.clone())
 
     def _switch_to_next_by_priority(self):
