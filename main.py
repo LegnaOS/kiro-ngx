@@ -157,7 +157,7 @@ def main():
         logger.info("Admin UI:")
         logger.info("  GET  /admin")
 
-    uvicorn.run(app, host=config.host, port=config.port, log_level="info")
+    uvicorn.run(app, host=config.host, port=config.port, log_level="info", timeout_keep_alive=120)
 
 
 if __name__ == "__main__":

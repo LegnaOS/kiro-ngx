@@ -41,13 +41,13 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
 
   return (
     <div className="space-y-6">
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
         <StatCard icon={<Hash className="h-4 w-4" />} label="总调用次数" value={stats?.totalRequests ?? '-'} />
         <StatCard icon={<Zap className="h-4 w-4" />} label="本次会话调用" value={stats?.sessionRequests ?? '-'} />
         <StatCard icon={<Activity className="h-4 w-4" />} label="当前 RPM" value={stats?.rpm ?? '-'} color="text-blue-600" />
         <StatCard icon={<TrendingUp className="h-4 w-4" />} label="峰值 RPM" value={stats?.peakRpm ?? '-'} color="text-orange-600" />
       </div>
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
         <StatCard icon={<Server className="h-4 w-4" />} label="凭据总数" value={credentialCount} />
         <StatCard icon={<Server className="h-4 w-4" />} label="可用凭据" value={availableCount} color="text-green-600" />
         <TokenStatCard
@@ -61,7 +61,7 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
           yesterday={tokenUsage?.yesterday.output ?? 0}
         />
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid gap-4 grid-cols-2 md:grid-cols-2">
         <StatCard icon={<Cpu className="h-4 w-4" />} label="CPU 使用率" value={sysStats ? `${sysStats.cpuPercent}%` : '-'} />
         <StatCard icon={<HardDrive className="h-4 w-4" />} label="进程内存" value={sysStats ? `${sysStats.memoryMb} MB` : '-'} />
       </div>
@@ -107,8 +107,8 @@ function ModelBar({ model, total, pct, segments, inputTokens, outputTokens }: {
   const [hovered, setHovered] = useState(false)
 
   return (
-    <div className="flex items-center gap-3">
-      <span className="text-sm font-mono w-48 truncate" title={model}>{model}</span>
+    <div className="flex items-center gap-2 md:gap-3">
+      <span className="text-sm font-mono w-20 md:w-48 truncate" title={model}>{model}</span>
       <div
         className="flex-1 h-6 bg-muted rounded-full overflow-hidden relative cursor-pointer"
         onMouseEnter={() => setHovered(true)}
@@ -153,8 +153,8 @@ function ModelBar({ model, total, pct, segments, inputTokens, outputTokens }: {
           </div>
         )}
       </div>
-      <span className="text-sm font-medium w-12 text-right">{total}</span>
-      <span className="text-xs text-muted-foreground w-36 text-right font-mono" title={`输入: ${inputTokens.toLocaleString()} / 输出: ${outputTokens.toLocaleString()}`}>
+      <span className="text-sm font-medium w-8 md:w-12 text-right">{total}</span>
+      <span className="text-xs text-muted-foreground w-36 text-right font-mono hidden md:inline" title={`输入: ${inputTokens.toLocaleString()} / 输出: ${outputTokens.toLocaleString()}`}>
         {formatTokenCount(inputTokens)} / {formatTokenCount(outputTokens)}
       </span>
     </div>

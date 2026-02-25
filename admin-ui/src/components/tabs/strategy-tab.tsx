@@ -130,7 +130,7 @@ export function StrategyTab() {
           value={newModelId}
           onChange={e => setNewModelId(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && handleAddCustomModel()}
-          className="w-64"
+          className="w-full md:w-64"
         />
         <Button onClick={handleAddCustomModel} disabled={!newModelId.trim()} size="sm" variant="outline">
           <Plus className="h-4 w-4 mr-1" />

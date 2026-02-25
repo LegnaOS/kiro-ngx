@@ -122,6 +122,7 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
 
     async def event_generator():
         from kiro.parser.decoder import EventStreamDecoder
+        from kiro.parser.error import BufferOverflow
 
         for evt in initial_events:
             yield evt.to_sse_string()
@@ -138,7 +139,11 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
                 except asyncio.TimeoutError:
                     yield ping_event
                     continue
-                decoder.feed(chunk)
+                try:
+                    decoder.feed(chunk)
+                except BufferOverflow as e:
+                    logger.warning("缓冲区溢出: %s", e)
+                    continue
                 for frame in decoder.decode_all():
                     event = _parse_event(frame)
                     if event is not None:
@@ -166,7 +171,7 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
@@ -181,6 +186,7 @@ async def _handle_stream_request_buffered(provider, request_body: str, model: st
 
     async def event_generator():
         from kiro.parser.decoder import EventStreamDecoder
+        from kiro.parser.error import BufferOverflow
 
         decoder = EventStreamDecoder()
         ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
@@ -195,7 +201,11 @@ async def _handle_stream_request_buffered(provider, request_body: str, model: st
                 except asyncio.TimeoutError:
                     yield ping_event
                     continue
-                decoder.feed(chunk)
+                try:
+                    decoder.feed(chunk)
+                except BufferOverflow as e:
+                    logger.warning("缓冲区溢出: %s", e)
+                    continue
                 for frame in decoder.decode_all():
                     event = _parse_event(frame)
                     if event is not None:
@@ -224,7 +234,7 @@ async def _handle_stream_request_buffered(provider, request_body: str, model: st
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
@@ -519,6 +529,7 @@ async def _handle_stream_auto_continue(
 
     async def event_generator():
         from kiro.parser.decoder import EventStreamDecoder
+        from kiro.parser.error import BufferOverflow
         ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
 
         current_response = first_response
@@ -552,7 +563,11 @@ async def _handle_stream_auto_continue(
                     except asyncio.TimeoutError:
                         yield ping_event
                         continue
-                    decoder.feed(chunk)
+                    try:
+                        decoder.feed(chunk)
+                    except BufferOverflow as e:
+                        logger.warning("缓冲区溢出: %s", e)
+                        continue
                     for frame in decoder.decode_all():
                         event = _parse_event(frame)
                         if event is None:
@@ -658,7 +673,7 @@ async def _handle_stream_auto_continue(
             is_first_round = False
 
     return StreamingResponse(event_generator(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
 
 async def count_tokens(payload: CountTokensRequest):

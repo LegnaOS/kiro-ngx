@@ -200,7 +200,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </button>
               {/* Commit 列表面板 */}
               {showCommitPanel && (
-                <div ref={panelRef} className="absolute top-full left-0 mt-2 z-[60] w-96 max-h-80 overflow-y-auto rounded-lg border bg-popover shadow-lg">
+                <div ref={panelRef} className="absolute top-full left-0 mt-2 z-[60] w-[calc(100vw-2rem)] md:w-96 max-h-80 overflow-y-auto rounded-lg border bg-popover shadow-lg">
                   {loadingCommits ? (
                     <div className="flex items-center justify-center py-8">
                       <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-primary" />
@@ -236,43 +236,44 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </div>
             {/* Tab 切换 */}
-            <nav className="flex items-center gap-1 ml-4">
+            <nav className="flex items-center gap-1 ml-2 md:ml-4">
               {TABS.map(tab => (
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm transition-colors ${
+                  className={`flex items-center gap-1.5 px-2 md:px-3 py-1.5 rounded-md text-sm transition-colors ${
                     activeTab === tab.id
                       ? 'bg-primary text-primary-foreground'
                       : 'text-muted-foreground hover:text-foreground hover:bg-muted'
                   }`}
+                  title={tab.label}
                 >
                   {tab.icon}
-                  {tab.label}
+                  <span className="hidden md:inline">{tab.label}</span>
                 </button>
               ))}
             </nav>
           </div>
           <div className="flex items-center gap-1 flex-shrink-0">
-            <Button variant="ghost" size="sm" className="gap-1" onClick={handleToggleLog}>
+            <Button variant="ghost" size="sm" className="gap-1" onClick={handleToggleLog} title={logEnabled ? '日志开' : '日志关'}>
               <ScrollText className={`h-4 w-4 ${logEnabled ? 'text-green-500' : ''}`} />
-              <span className="text-xs">{logEnabled ? '日志开' : '日志关'}</span>
+              <span className="text-xs hidden md:inline">{logEnabled ? '日志开' : '日志关'}</span>
             </Button>
-            <Button variant="ghost" size="sm" className="gap-1" onClick={toggleDarkMode}>
+            <Button variant="ghost" size="sm" className="gap-1" onClick={toggleDarkMode} title={darkMode ? '浅色' : '深色'}>
               {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-              <span className="text-xs">{darkMode ? '浅色' : '深色'}</span>
+              <span className="text-xs hidden md:inline">{darkMode ? '浅色' : '深色'}</span>
             </Button>
-            <Button variant="ghost" size="sm" className="gap-1" onClick={() => setConfirmAction('restart')} disabled={restarting || updating}>
+            <Button variant="ghost" size="sm" className="gap-1" onClick={() => setConfirmAction('restart')} disabled={restarting || updating} title="重启">
               <Power className={`h-4 w-4 ${restarting ? 'animate-spin' : ''}`} />
-              <span className="text-xs">重启</span>
+              <span className="text-xs hidden md:inline">重启</span>
             </Button>
-            <Button variant="ghost" size="sm" className="gap-1" onClick={handleRefresh}>
+            <Button variant="ghost" size="sm" className="gap-1" onClick={handleRefresh} title="刷新">
               <RefreshCw className="h-4 w-4" />
-              <span className="text-xs">刷新</span>
+              <span className="text-xs hidden md:inline">刷新</span>
             </Button>
-            <Button variant="ghost" size="sm" className="gap-1" onClick={handleLogout}>
+            <Button variant="ghost" size="sm" className="gap-1" onClick={handleLogout} title="退出">
               <LogOut className="h-4 w-4" />
-              <span className="text-xs">退出</span>
+              <span className="text-xs hidden md:inline">退出</span>
             </Button>
           </div>
         </div>

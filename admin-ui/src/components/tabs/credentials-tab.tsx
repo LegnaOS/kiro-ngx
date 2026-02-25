@@ -207,7 +207,7 @@ export function CredentialsTab() {
   }
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
         <div className="flex items-center gap-4">
           <h2 className="text-xl font-semibold">凭据管理</h2>
           {selectedIds.size > 0 && (

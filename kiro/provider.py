@@ -109,7 +109,7 @@ class KiroProvider:
             "amz-sdk-invocation-id": str(uuid.uuid4()),
             "amz-sdk-request": "attempt=1; max=3",
             "Authorization": f"Bearer {ctx.token}",
-            "Connection": "close",
+            "Connection": "keep-alive",
         }
 
     def build_mcp_headers(self, ctx: CallContext) -> dict[str, str]:
@@ -133,7 +133,7 @@ class KiroProvider:
             "amz-sdk-invocation-id": str(uuid.uuid4()),
             "amz-sdk-request": "attempt=1; max=3",
             "Authorization": f"Bearer {ctx.token}",
-            "Connection": "close",
+            "Connection": "keep-alive",
         }
 
     # --- API 调用 ---
@@ -202,10 +202,10 @@ class KiroProvider:
             client = self.client_for(ctx.credentials)
             try:
                 if is_stream:
-                    req = client.build_request("POST", url, headers=headers, content=request_body)
+                    req = client.build_request("POST", url, headers=headers, content=request_body.encode("utf-8"))
                     response = await client.send(req, stream=True)
                 else:
-                    response = await client.post(url, headers=headers, content=request_body)
+                    response = await client.post(url, headers=headers, content=request_body.encode("utf-8"))
             except Exception as e:
                 logger.warning("API 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e
@@ -286,7 +286,7 @@ class KiroProvider:
 
             client = self.client_for(ctx.credentials)
             try:
-                response = await client.post(url, headers=headers, content=request_body)
+                response = await client.post(url, headers=headers, content=request_body.encode("utf-8"))
             except Exception as e:
                 logger.warning("MCP 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e

@@ -188,8 +188,17 @@ class SseStateManager:
 
 
 def estimate_tokens(text: str) -> int:
-    """基于 UTF-8 字节长度的 token 近似估算（utf8_len / 4）"""
-    return max(len(text.encode("utf-8")) // 4, 1)
+    """token 近似估算：中文约 1.5 字符/token，其他约 4 字符/token"""
+    chinese_count = 0
+    other_count = 0
+    for c in text:
+        if '\u4e00' <= c <= '\u9fff':
+            chinese_count += 1
+        else:
+            other_count += 1
+    chinese_tokens = (chinese_count * 2 + 2) // 3
+    other_tokens = (other_count + 3) // 4
+    return max(chinese_tokens + other_tokens, 1)
 
 
 class StreamContext:

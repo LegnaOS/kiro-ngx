@@ -160,7 +160,7 @@ export function CredentialCard({
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息网格 */}
-          <div className="grid grid-cols-2 gap-4 text-sm">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
             <div>
               <span className="text-muted-foreground">优先级：</span>
               {editingPriority ? (
@@ -267,8 +267,8 @@ export function CredentialCard({
               onClick={handleReset}
               disabled={resetFailure.isPending || credential.failureCount === 0}
             >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              重置失败
+              <RefreshCw className="h-4 w-4 sm:mr-1" />
+              <span className="hidden sm:inline">重置失败</span>
             </Button>
             <Button
               size="sm"
@@ -285,8 +285,8 @@ export function CredentialCard({
               }}
               disabled={setPriority.isPending || credential.priority === 0}
             >
-              <ChevronUp className="h-4 w-4 mr-1" />
-              提高优先级
+              <ChevronUp className="h-4 w-4 sm:mr-1" />
+              <span className="hidden sm:inline">提高优先级</span>
             </Button>
             <Button
               size="sm"
@@ -303,16 +303,16 @@ export function CredentialCard({
               }}
               disabled={setPriority.isPending}
             >
-              <ChevronDown className="h-4 w-4 mr-1" />
-              降低优先级
+              <ChevronDown className="h-4 w-4 sm:mr-1" />
+              <span className="hidden sm:inline">降低优先级</span>
             </Button>
             <Button
               size="sm"
               variant="default"
               onClick={() => onViewBalance(credential.id)}
             >
-              <Wallet className="h-4 w-4 mr-1" />
-              查看余额
+              <Wallet className="h-4 w-4 sm:mr-1" />
+              <span className="hidden sm:inline">查看余额</span>
             </Button>
             <Button
               size="sm"
@@ -321,8 +321,8 @@ export function CredentialCard({
               disabled={!credential.disabled}
               title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
             >
-              <Trash2 className="h-4 w-4 mr-1" />
-              删除
+              <Trash2 className="h-4 w-4 sm:mr-1" />
+              <span className="hidden sm:inline">删除</span>
             </Button>
           </div>
         </CardContent>
