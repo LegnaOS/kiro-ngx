@@ -265,7 +265,17 @@ class StreamContext:
         if isinstance(event, AssistantResponseEvent):
             return self._process_assistant_response(event.content)
         elif isinstance(event, ToolUseEvent):
-            return self._process_tool_use(event)
+            try:
+                return self._process_tool_use(event)
+            except Exception:
+                # 单个 tool_use 事件处理失败不应中断整个流
+                logger.error("处理 ToolUseEvent 异常 (id=%s, name=%s, input_type=%s, input_len=%s, stop=%s)",
+                             event.tool_use_id, event.name,
+                             type(event.input).__name__,
+                             len(event.input) if isinstance(event.input, str) else "N/A",
+                             event.stop,
+                             exc_info=True)
+                return []
         elif isinstance(event, ContextUsageEvent):
             actual = int(event.context_usage_percentage * CONTEXT_WINDOW_SIZE / 100.0)
             self.context_input_tokens = actual
@@ -439,20 +449,28 @@ class StreamContext:
 
         # 参数增量
         if tool_use.input:
-            self.output_tokens += (len(tool_use.input) + 3) // 4
-            # 累积 tool_use 的 JSON 输入
-            buf = self._tool_json_buffers.get(tool_use.tool_use_id, "")
-            buf += tool_use.input
-            self._tool_json_buffers[tool_use.tool_use_id] = buf
-            delta = self.state_manager.handle_content_block_delta(block_index, {
-                "type": "content_block_delta", "index": block_index,
-                "delta": {"type": "input_json_delta", "partial_json": tool_use.input},
-            })
-            if delta:
-                events.append(delta)
+            if not isinstance(tool_use.input, str):
+                logger.warning("流式 ToolUseEvent.input 类型异常: id=%s, name=%s, type=%s",
+                               tool_use.tool_use_id, tool_use.name, type(tool_use.input).__name__)
+            else:
+                self.output_tokens += (len(tool_use.input) + 3) // 4
+                # 累积 tool_use 的 JSON 输入
+                buf = self._tool_json_buffers.get(tool_use.tool_use_id, "")
+                buf += tool_use.input
+                self._tool_json_buffers[tool_use.tool_use_id] = buf
+                delta = self.state_manager.handle_content_block_delta(block_index, {
+                    "type": "content_block_delta", "index": block_index,
+                    "delta": {"type": "input_json_delta", "partial_json": tool_use.input},
+                })
+                if delta:
+                    events.append(delta)
 
         # 完整工具调用
         if tool_use.stop:
+            accumulated = self._tool_json_buffers.get(tool_use.tool_use_id, "")
+            if not accumulated:
+                logger.warning("ToolUseEvent stop=true 但 JSON 缓冲区为空: id=%s, name=%s",
+                               tool_use.tool_use_id, tool_use.name)
             stop = self.state_manager.handle_content_block_stop(block_index)
             if stop:
                 events.append(stop)

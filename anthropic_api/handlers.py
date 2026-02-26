@@ -253,13 +253,25 @@ def _parse_event(frame):
     try:
         data = frame.payload_as_json() if frame.payload else {}
     except Exception:
-        data = {}
+        # Rust 版在 payload 解析失败时会跳过整个事件，Python 版也应如此
+        logger.warning("帧 payload JSON 解析失败 (event_type=%s), 跳过", event_type)
+        return None
+
+    if not isinstance(data, dict):
+        logger.warning("帧 payload 不是 dict (event_type=%s, type=%s), 跳过",
+                       event_type, type(data).__name__)
+        return None
 
     et = EventType.from_str(event_type)
     if et == EventType.ASSISTANT_RESPONSE:
         return AssistantResponseEvent.from_dict(data)
     elif et == EventType.TOOL_USE:
-        return ToolUseEvent.from_dict(data)
+        evt = ToolUseEvent.from_dict(data)
+        # 有效的 ToolUseEvent 必须有 tool_use_id
+        if not evt.tool_use_id:
+            logger.warning("ToolUseEvent 缺少 toolUseId, 跳过: %s", repr(data)[:300])
+            return None
+        return evt
     elif et == EventType.CONTEXT_USAGE:
         return ContextUsageEvent.from_dict(data)
     elif event_type == "exception":
@@ -304,12 +316,21 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
             text_parts.append(event.content)
         elif isinstance(event, ToolUseEvent):
             has_tool_use = True
+            if not isinstance(event.input, str):
+                logger.warning("非流式 ToolUseEvent.input 类型异常: id=%s, type=%s",
+                               event.tool_use_id, type(event.input).__name__)
+                continue
             tool_json_parts.setdefault(event.tool_use_id, []).append(event.input)
             if event.stop:
                 buf = "".join(tool_json_parts.get(event.tool_use_id, []))
+                if not buf:
+                    logger.warning("ToolUseEvent JSON 缓冲区为空: id=%s, name=%s",
+                                   event.tool_use_id, event.name)
                 try:
                     inp = json.loads(buf) if buf else {}
                 except json.JSONDecodeError:
+                    logger.error("ToolUseEvent JSON 解析失败: id=%s, name=%s, buf=%s",
+                                 event.tool_use_id, event.name, repr(buf)[:500])
                     inp = {}
                 tool_uses.append({"type": "tool_use", "id": event.tool_use_id, "name": event.name, "input": inp})
         elif isinstance(event, ContextUsageEvent):
