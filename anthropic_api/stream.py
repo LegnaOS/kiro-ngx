@@ -403,7 +403,6 @@ class StreamContext:
 
     def _process_tool_use(self, tool_use) -> List[SseEvent]:
         events: List[SseEvent] = []
-        self.state_manager.set_has_tool_use(True)
 
         # 处理 thinking 块在 tool_use 之前的边界场景
         if self.thinking_enabled and self.in_thinking_block:
@@ -432,56 +431,61 @@ class StreamContext:
             self.thinking_buffer = ""
             events.extend(self._create_text_delta_events(buffered))
 
-        # 获取或分配块索引
-        block_index = self.tool_block_indices.get(tool_use.tool_use_id)
-        if block_index is None:
-            block_index = self.state_manager.next_block_index()
-            self.tool_block_indices[tool_use.tool_use_id] = block_index
-
-        # content_block_start
-        events.extend(self.state_manager.handle_content_block_start(block_index, "tool_use", {
-            "type": "content_block_start", "index": block_index,
-            "content_block": {
-                "type": "tool_use", "id": tool_use.tool_use_id,
-                "name": tool_use.name, "input": {},
-            },
-        }))
-
-        # 参数增量
+        # 参数分片先缓存；仅在 stop=true 时对下游输出完整 tool_use，避免半截 tool_call 污染会话。
         if tool_use.input:
             if not isinstance(tool_use.input, str):
                 logger.warning("流式 ToolUseEvent.input 类型异常: id=%s, name=%s, type=%s",
                                tool_use.tool_use_id, tool_use.name, type(tool_use.input).__name__)
             else:
                 self.output_tokens += (len(tool_use.input) + 3) // 4
-                # 累积 tool_use 的 JSON 输入
                 buf = self._tool_json_buffers.get(tool_use.tool_use_id, "")
                 buf += tool_use.input
                 self._tool_json_buffers[tool_use.tool_use_id] = buf
+
+        # 完整工具调用
+        if tool_use.stop:
+            self.state_manager.set_has_tool_use(True)
+            final_input = self._tool_json_buffers.get(tool_use.tool_use_id, "")
+            if not final_input:
+                logger.warning("ToolUseEvent stop=true 但 JSON 缓冲区为空: id=%s, name=%s",
+                               tool_use.tool_use_id, tool_use.name)
+
+            # 获取或分配块索引
+            block_index = self.tool_block_indices.get(tool_use.tool_use_id)
+            if block_index is None:
+                block_index = self.state_manager.next_block_index()
+                self.tool_block_indices[tool_use.tool_use_id] = block_index
+
+            # content_block_start
+            events.extend(self.state_manager.handle_content_block_start(block_index, "tool_use", {
+                "type": "content_block_start", "index": block_index,
+                "content_block": {
+                    "type": "tool_use", "id": tool_use.tool_use_id,
+                    "name": tool_use.name, "input": {},
+                },
+            }))
+
+            if final_input:
                 delta = self.state_manager.handle_content_block_delta(block_index, {
                     "type": "content_block_delta", "index": block_index,
-                    "delta": {"type": "input_json_delta", "partial_json": tool_use.input},
+                    "delta": {"type": "input_json_delta", "partial_json": final_input},
                 })
                 if delta:
                     events.append(delta)
 
-        # 完整工具调用
-        if tool_use.stop:
-            accumulated = self._tool_json_buffers.get(tool_use.tool_use_id, "")
-            if not accumulated:
-                logger.warning("ToolUseEvent stop=true 但 JSON 缓冲区为空: id=%s, name=%s",
-                               tool_use.tool_use_id, tool_use.name)
             stop = self.state_manager.handle_content_block_stop(block_index)
             if stop:
                 events.append(stop)
             # 记录 web_search tool_use
             if tool_use.name == "web_search":
-                input_json = self._tool_json_buffers.get(tool_use.tool_use_id, "")
+                input_json = final_input
                 self.web_search_tool_uses.append({
                     "tool_use_id": tool_use.tool_use_id,
                     "name": tool_use.name,
                     "input_json": input_json,
                 })
+            self._tool_json_buffers.pop(tool_use.tool_use_id, None)
+            self.tool_block_indices.pop(tool_use.tool_use_id, None)
 
         return events
 
@@ -524,6 +528,16 @@ class StreamContext:
                 and not self.state_manager._has_non_thinking_blocks()):
             self.state_manager.set_stop_reason("max_tokens")
             events.extend(self._create_text_delta_events(" "))
+
+        # 丢弃未完成的 tool_use（缺少 stop=true），避免写入空/半截 tool_call。
+        if self._tool_json_buffers:
+            for tid in list(self._tool_json_buffers.keys()):
+                logger.warning(
+                    "丢弃未完成 tool_use: tool_use_id=%s, pending_input_len=%d",
+                    tid, len(self._tool_json_buffers.get(tid, "")),
+                )
+                self._tool_json_buffers.pop(tid, None)
+                self.tool_block_indices.pop(tid, None)
 
         final_input = self.context_input_tokens if self.context_input_tokens is not None else self.input_tokens
         events.extend(self.state_manager.generate_final_events(final_input, self.output_tokens))

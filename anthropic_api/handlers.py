@@ -1,6 +1,7 @@
 """Anthropic API Handler 函数 - 参考 src/anthropic/handlers.rs"""
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -25,6 +26,29 @@ from token_usage import get_token_usage_tracker
 logger = logging.getLogger(__name__)
 
 PING_INTERVAL_SECS = 25
+
+
+async def _iter_stream_chunks_with_ping(response, ping_interval: float):
+    """轮询流式分片，超时仅产出 ping 信号，不取消底层读取任务。"""
+    chunk_iter = response.aiter_bytes().__aiter__()
+    pending_task = asyncio.create_task(chunk_iter.__anext__())
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending_task}, timeout=ping_interval)
+            if not done:
+                yield None
+                continue
+            try:
+                chunk = pending_task.result()
+            except StopAsyncIteration:
+                break
+            yield chunk
+            pending_task = asyncio.create_task(chunk_iter.__anext__())
+    finally:
+        if not pending_task.done():
+            pending_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending_task
 
 
 def _map_provider_error(err: Exception):
@@ -130,13 +154,8 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
         ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
         decoder = EventStreamDecoder()
         try:
-            chunk_iter = response.aiter_bytes().__aiter__()
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=PING_INTERVAL_SECS)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
+            async for chunk in _iter_stream_chunks_with_ping(response, PING_INTERVAL_SECS):
+                if chunk is None:
                     yield ping_event
                     continue
                 try:
@@ -192,13 +211,8 @@ async def _handle_stream_request_buffered(provider, request_body: str, model: st
         ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
 
         try:
-            chunk_iter = response.aiter_bytes().__aiter__()
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=PING_INTERVAL_SECS)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
+            async for chunk in _iter_stream_chunks_with_ping(response, PING_INTERVAL_SECS):
+                if chunk is None:
                     yield ping_event
                     continue
                 try:
@@ -575,13 +589,8 @@ async def _handle_stream_auto_continue(
             decoder = EventStreamDecoder()
 
             try:
-                chunk_iter = current_response.aiter_bytes().__aiter__()
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=PING_INTERVAL_SECS)
-                    except StopAsyncIteration:
-                        break
-                    except asyncio.TimeoutError:
+                async for chunk in _iter_stream_chunks_with_ping(current_response, PING_INTERVAL_SECS):
+                    if chunk is None:
                         yield ping_event
                         continue
                     try:
