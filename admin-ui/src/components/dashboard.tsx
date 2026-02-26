@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Power, Home, KeyRound, Settings, ScrollText, AlertTriangle, GitBranch, Check } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Power, Home, KeyRound, Settings, ScrollText, AlertTriangle, GitBranch, Check, Puzzle } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -18,17 +18,19 @@ import {
 import { HomeTab } from '@/components/tabs/home-tab'
 import { CredentialsTab } from '@/components/tabs/credentials-tab'
 import { StrategyTab } from '@/components/tabs/strategy-tab'
+import { PluginsTab } from '@/components/tabs/plugins-tab'
 
 interface DashboardProps {
   onLogout: () => void
 }
 
-type TabId = 'home' | 'credentials' | 'strategy'
+type TabId = 'home' | 'credentials' | 'strategy' | 'plugins'
 
 const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
   { id: 'home', label: '首页', icon: <Home className="h-4 w-4" /> },
   { id: 'credentials', label: '凭据管理', icon: <KeyRound className="h-4 w-4" /> },
   { id: 'strategy', label: '策略配置', icon: <Settings className="h-4 w-4" /> },
+  { id: 'plugins', label: '插件', icon: <Puzzle className="h-4 w-4" /> },
 ]
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -285,6 +287,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         )}
         {activeTab === 'credentials' && <CredentialsTab />}
         {activeTab === 'strategy' && <StrategyTab />}
+        {activeTab === 'plugins' && <PluginsTab />}
       </main>
 
       {/* 重启/更新确认对话框 */}

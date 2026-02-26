@@ -23,6 +23,11 @@ kiro_balance_cache.json
 kiro_groups.json
 kiro_routing.json
 
+# 插件运行时数据
+plugins/**/expired_records.json
+plugins/**/*.db
+plugins/**/*.sqlite
+
 # 日志
 logs/
 

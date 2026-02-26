@@ -20,6 +20,7 @@ from anthropic_api.router import create_router_with_provider
 from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middleware
 from admin import AdminService, AdminAuthMiddleware, create_admin_router
 from admin.ui_router import create_admin_ui_router
+from plugin_loader import load_plugins, get_loaded_plugins
 from anthropic_api.message_log import init_message_logger
 from token_usage import init_token_usage_tracker
 
@@ -124,6 +125,13 @@ def main():
         admin_app = FastAPI()
         admin_app.include_router(admin_router)
         admin_app.state.admin_service = admin_service
+
+        # 加载插件（路由注册到 admin_app，共享 admin 认证）
+        loaded_plugins = load_plugins(admin_app)
+        admin_app.state.loaded_plugins = loaded_plugins
+        # 插件发现端点
+        admin_app.add_api_route("/plugins", get_loaded_plugins, methods=["GET"])
+
         admin_app.add_middleware(AdminAuthMiddleware, admin_api_key=admin_key)
         app.mount("/api/admin", admin_app)
 

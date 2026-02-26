@@ -1,0 +1,641 @@
+"""Kiroshop 补货代理 handlers — 转发请求到 kiroshop.xyz"""
+
+import math
+import asyncio
+import logging
+from pathlib import Path
+from urllib.request import Request as UrlRequest, urlopen
+from urllib.error import HTTPError, URLError
+import json
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
+
+_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+
+KIROSHOP_BASE = "https://kiroshop.xyz/shop/api"
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+
+
+def _kiroshop_headers(token: str, referer: str = "https://kiroshop.xyz/shop") -> dict:
+    return {
+        "Accept": "*/*",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Referer": referer,
+        "User-Agent": _UA,
+    }
+
+
+def _extract_token(request: Request) -> str | None:
+    return request.headers.get("x-kiroshop-token")
+
+
+def _kiroshop_get(url: str, token: str, referer: str = "https://kiroshop.xyz/shop") -> dict | list:
+    headers = _kiroshop_headers(token, referer)
+    req = UrlRequest(url, headers=headers, method="GET")
+    with urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _kiroshop_post(url: str, token: str, body: dict, referer: str = "https://kiroshop.xyz/shop/orders") -> dict:
+    headers = _kiroshop_headers(token, referer)
+    data = json.dumps(body).encode("utf-8")
+    req = UrlRequest(url, data=data, headers=headers, method="POST")
+    with urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+# --- 登录获取 Token ---
+async def restock_login(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "无效的请求体"})
+
+    email = body.get("email", "").strip()
+    password = body.get("password", "").strip()
+    if not email or not password:
+        return JSONResponse(status_code=400, content={"error": "缺少 email 或 password"})
+
+    try:
+        headers = {
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Origin": "https://kiroshop.xyz",
+            "Referer": "https://kiroshop.xyz/shop",
+            "User-Agent": _UA,
+        }
+        data = json.dumps({"email": email, "password": password}).encode("utf-8")
+        req = UrlRequest("https://kiroshop.xyz/shop/api/auth/login",
+                         data=data, headers=headers, method="POST")
+        with urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        token = result.get("token", "")
+        if not token:
+            return JSONResponse(status_code=401, content={"error": "登录失败，未返回 token"})
+        return JSONResponse(content={"token": token})
+    except HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body_text})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+async def get_restock_inventory(request: Request) -> JSONResponse:
+    token = _extract_token(request)
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "缺少 x-kiroshop-token"})
+    try:
+        data = _kiroshop_get(f"{KIROSHOP_BASE}/products", token)
+        return JSONResponse(content=data)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# --- 订单列表（自动分页 + 过滤已完成/已取消）---
+async def get_restock_orders(request: Request) -> JSONResponse:
+    token = _extract_token(request)
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "缺少 x-kiroshop-token"})
+    try:
+        all_orders = []
+        page, page_size, total_pages = 1, 20, 1
+        while page <= total_pages:
+            result = _kiroshop_get(
+                f"{KIROSHOP_BASE}/orders?page={page}&page_size={page_size}",
+                token, "https://kiroshop.xyz/shop/orders",
+            )
+            all_orders.extend(result.get("items", []))
+            if page == 1:
+                total = result.get("total", 0)
+                total_pages = math.ceil(total / page_size) if total > 0 else 1
+            page += 1
+        filtered = [o for o in all_orders if o.get("status") not in ("completed", "cancelled")]
+        return JSONResponse(content={"orders": filtered, "total": len(filtered)})
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# --- 订单详情 ---
+async def get_restock_order_detail(request: Request, order_id: int) -> JSONResponse:
+    token = _extract_token(request)
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "缺少 x-kiroshop-token"})
+    try:
+        data = _kiroshop_get(
+            f"{KIROSHOP_BASE}/orders/{order_id}",
+            token, "https://kiroshop.xyz/shop/orders",
+        )
+        return JSONResponse(content=data)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# --- 封禁检测 ---
+async def check_restock_ban(request: Request, order_id: int) -> JSONResponse:
+    token = _extract_token(request)
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "缺少 x-kiroshop-token"})
+    try:
+        detail = _kiroshop_get(
+            f"{KIROSHOP_BASE}/orders/{order_id}",
+            token, "https://kiroshop.xyz/shop/orders",
+        )
+        deliveries = detail.get("deliveries", [])
+        if not deliveries:
+            return JSONResponse(content={"deliveries": [], "message": "该订单暂无发货信息"})
+
+        results = []
+        for delivery in deliveries:
+            delivery_id = delivery.get("id")
+            if not delivery_id:
+                continue
+            check_data = _kiroshop_post(
+                f"{KIROSHOP_BASE}/orders/{order_id}/check-ban",
+                token, {"delivery_id": delivery_id},
+            )
+            results.append({
+                "delivery_id": delivery_id,
+                "success": check_data.get("success", False),
+                "total": check_data.get("total", 0),
+                "banned_count": check_data.get("banned_count", 0),
+                "results": check_data.get("results", []),
+            })
+        return JSONResponse(content={"deliveries": results})
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# --- 配置读写 ---
+async def get_restock_config(request: Request) -> JSONResponse:
+    try:
+        if _CONFIG_PATH.exists():
+            data = json.loads(_CONFIG_PATH.read_text("utf-8"))
+        else:
+            data = {}
+        return JSONResponse(content={
+            "email": data.get("email", ""),
+            "password": data.get("password", ""),
+            "token": data.get("token", ""),
+        })
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+async def save_restock_config(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "无效的请求体"})
+
+    existing = {}
+    if _CONFIG_PATH.exists():
+        try:
+            existing = json.loads(_CONFIG_PATH.read_text("utf-8"))
+        except Exception:
+            pass
+
+    for key in ("email", "password", "token"):
+        if key in body:
+            existing[key] = body[key]
+
+    _CONFIG_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), "utf-8")
+    return JSONResponse(content={"success": True})
+
+
+# --- 提货 ---
+async def restock_deliver(request: Request, order_id: int) -> JSONResponse:
+    token = _extract_token(request)
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "缺少 x-kiroshop-token"})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "无效的请求体"})
+
+    count = body.get("count", 0)
+    if not isinstance(count, int) or count <= 0:
+        return JSONResponse(status_code=400, content={"error": "count 必须为正整数"})
+
+    try:
+        data = _kiroshop_post(
+            f"{KIROSHOP_BASE}/orders/{order_id}/deliver",
+            token, {"count": count},
+        )
+        return JSONResponse(content=data)
+    except HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body_text})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# --- 一键换号 ---
+async def restock_batch_replace(request: Request, order_id: int) -> JSONResponse:
+    token = _extract_token(request)
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "缺少 x-kiroshop-token"})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "无效的请求体"})
+
+    delivery_id = body.get("delivery_id")
+    if not delivery_id:
+        return JSONResponse(status_code=400, content={"error": "缺少 delivery_id"})
+
+    try:
+        data = _kiroshop_post(
+            f"{KIROSHOP_BASE}/orders/{order_id}/batch-replace-banned",
+            token, {"delivery_id": delivery_id},
+        )
+        return JSONResponse(content=data)
+    except HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body_text})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# --- 过保分析 + 封号检测 ---
+
+def _parse_time(time_str: str) -> datetime | None:
+    if not time_str:
+        return None
+    try:
+        return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _check_warranty(delivered_at_str: str, warranty_hours: int):
+    """返回 (is_expired, warranty_msg)"""
+    if warranty_hours <= 0:
+        return False, "无质保"
+    delivered_at = _parse_time(delivered_at_str)
+    if not delivered_at:
+        return False, "无发货时间"
+    expire_time = delivered_at + timedelta(hours=warranty_hours)
+    now = datetime.now()
+    if now > expire_time:
+        return True, f"已过保 ({expire_time.strftime('%m-%d %H:%M')})"
+    remaining_h = (expire_time - now).total_seconds() / 3600
+    return False, f"剩余 {remaining_h:.1f}h ({expire_time.strftime('%m-%d %H:%M')})"
+
+
+def _check_ban_sync(order_id: int, delivery_id: int, token: str) -> dict:
+    """对单个 delivery 执行封号检测，返回检测结果"""
+    try:
+        data = _kiroshop_post(
+            f"{KIROSHOP_BASE}/orders/{order_id}/check-ban",
+            token, {"delivery_id": delivery_id},
+        )
+        return {
+            "success": True,
+            "total": data.get("total", 0),
+            "banned_count": data.get("banned_count", 0),
+            "results": data.get("results", []),
+        }
+    except Exception as e:
+        return {"success": False, "total": 0, "banned_count": 0, "results": [], "error": str(e)}
+
+
+async def analyze_restock_orders(request: Request) -> JSONResponse:
+    """分析所有 paid 订单：逐个 delivery 检测封号 + 质保状态，封号且在保 = 待补号"""
+    token = _extract_token(request)
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "缺少 x-kiroshop-token"})
+
+    try:
+        # 获取所有订单
+        all_orders = []
+        page, page_size, total_pages = 1, 20, 1
+        while page <= total_pages:
+            result = _kiroshop_get(
+                f"{KIROSHOP_BASE}/orders?page={page}&page_size={page_size}",
+                token, "https://kiroshop.xyz/shop/orders",
+            )
+            all_orders.extend(result.get("items", []))
+            if page == 1:
+                total = result.get("total", 0)
+                total_pages = math.ceil(total / page_size) if total > 0 else 1
+            page += 1
+
+        paid_orders = [o for o in all_orders if o.get("status") == "paid"]
+        if not paid_orders:
+            return JSONResponse(content={"pending_tasks": [], "summaries": []})
+
+        pending_tasks = []
+        summaries = []
+
+        for order in paid_orders:
+            oid = order["id"]
+            warranty_hours = order.get("warranty_hours", 0)
+
+            try:
+                detail = _kiroshop_get(
+                    f"{KIROSHOP_BASE}/orders/{oid}",
+                    token, "https://kiroshop.xyz/shop/orders",
+                )
+            except Exception:
+                continue
+
+            deliveries = detail.get("deliveries", [])
+            if not deliveries:
+                summaries.append({
+                    "order_id": oid, "order_no": order.get("order_no", ""),
+                    "product_name": order.get("product_name", ""),
+                    "deliveries": [],
+                })
+                continue
+
+            d_infos = []
+            for d in deliveries:
+                did = d.get("id")
+                delivered_at = d.get("delivered_at", "")
+                account_count = d.get("account_count", 0)
+                is_expired, warranty_msg = _check_warranty(delivered_at, warranty_hours)
+
+                # 执行封号检测
+                ban_info = _check_ban_sync(oid, did, token)
+                banned_count = ban_info.get("banned_count", 0)
+                total_accounts = ban_info.get("total", 0)
+
+                # 封号 + 在保 = 待补号
+                need_replace = banned_count > 0 and not is_expired
+
+                d_info = {
+                    "delivery_id": did, "delivered_at": delivered_at,
+                    "account_count": account_count,
+                    "is_expired": is_expired, "warranty_msg": warranty_msg,
+                    "banned_count": banned_count, "total_accounts": total_accounts,
+                    "need_replace": need_replace,
+                }
+                d_infos.append(d_info)
+
+                if need_replace:
+                    pending_tasks.append({
+                        "order_id": oid, "delivery_id": did,
+                        "banned_count": banned_count,
+                        "warranty_msg": warranty_msg,
+                    })
+
+            summaries.append({
+                "order_id": oid, "order_no": order.get("order_no", ""),
+                "product_name": order.get("product_name", ""),
+                "deliveries": d_infos,
+            })
+
+        return JSONResponse(content={
+            "pending_tasks": pending_tasks,
+            "summaries": summaries,
+        })
+    except HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        return JSONResponse(status_code=e.code, content={"error": body_text})
+    except (URLError, Exception) as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# --- 自动补号后台任务 ---
+# 流程：启动时 analyze 获取待补号列表 → 循环检测库存(默认1秒) → 有货立即 batch-replace
+
+_auto_replace_state: dict = {
+    "running": False,
+    "task": None,
+    "pending_tasks": [],   # [{order_id, delivery_id, banned_count, warranty_msg}]
+    "stock": 0,
+    "last_check": "",
+    "interval": 1,
+    "logs": [],
+}
+_MAX_LOGS = 200
+
+
+def _ar_log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    _auto_replace_state["logs"].append(line)
+    if len(_auto_replace_state["logs"]) > _MAX_LOGS:
+        _auto_replace_state["logs"] = _auto_replace_state["logs"][-_MAX_LOGS:]
+    logger.info(f"[auto-replace] {msg}")
+
+
+def _try_replace_sync(order_id, delivery_id, token):
+    """同步换号"""
+    try:
+        data = _kiroshop_post(
+            f"{KIROSHOP_BASE}/orders/{order_id}/batch-replace-banned",
+            token, {"delivery_id": delivery_id},
+        )
+        return order_id, delivery_id, 200, data
+    except HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        return order_id, delivery_id, e.code, body_text
+    except Exception as e:
+        return order_id, delivery_id, -1, str(e)
+
+
+def _analyze_sync(token: str) -> list[dict]:
+    """同步版 analyze：check-ban 每个 delivery，封号+在保=待补号"""
+    all_orders = []
+    page, page_size, total_pages = 1, 20, 1
+    while page <= total_pages:
+        result = _kiroshop_get(
+            f"{KIROSHOP_BASE}/orders?page={page}&page_size={page_size}",
+            token, "https://kiroshop.xyz/shop/orders",
+        )
+        all_orders.extend(result.get("items", []))
+        if page == 1:
+            t = result.get("total", 0)
+            total_pages = math.ceil(t / page_size) if t > 0 else 1
+        page += 1
+
+    paid = [o for o in all_orders if o.get("status") == "paid"]
+    tasks = []
+    for order in paid:
+        oid = order["id"]
+        wh = order.get("warranty_hours", 0)
+        try:
+            detail = _kiroshop_get(
+                f"{KIROSHOP_BASE}/orders/{oid}",
+                token, "https://kiroshop.xyz/shop/orders",
+            )
+        except Exception:
+            continue
+        for d in detail.get("deliveries", []):
+            did = d.get("id")
+            delivered_at = d.get("delivered_at", "")
+            is_expired, warranty_msg = _check_warranty(delivered_at, wh)
+            if is_expired:
+                continue
+            # 在保 → 检测封号
+            ban = _check_ban_sync(oid, did, token)
+            if ban.get("banned_count", 0) > 0:
+                tasks.append({
+                    "order_id": oid, "delivery_id": did,
+                    "banned_count": ban["banned_count"],
+                    "warranty_msg": warranty_msg,
+                })
+    return tasks
+
+
+async def _auto_replace_loop():
+    """后台循环：只检测库存，有货立即对待补号列表执行 batch-replace"""
+    state = _auto_replace_state
+
+    def _read_config():
+        if _CONFIG_PATH.exists():
+            return json.loads(_CONFIG_PATH.read_text("utf-8"))
+        return {}
+
+    cfg = _read_config()
+    token = cfg.get("token", "")
+    if not token:
+        _ar_log("无 token，无法启动")
+        state["running"] = False
+        return
+
+    # 1. 先 analyze 获取待补号列表
+    _ar_log("正在分析订单封号状态...")
+    try:
+        tasks = _analyze_sync(token)
+    except Exception as e:
+        _ar_log(f"分析失败: {e}")
+        state["running"] = False
+        return
+
+    state["pending_tasks"] = tasks
+    if not tasks:
+        _ar_log("没有需要补号的 delivery，停止")
+        state["running"] = False
+        return
+
+    _ar_log(f"待补号: {len(tasks)} 个")
+    for t in tasks:
+        _ar_log(f"  订单{t['order_id']}/发货{t['delivery_id']} 封禁{t['banned_count']}个 {t['warranty_msg']}")
+
+    # 2. 持续检测库存
+    try:
+        while state["running"] and state["pending_tasks"]:
+            cfg = _read_config()
+            token = cfg.get("token", "")
+            interval = state["interval"]
+
+            try:
+                products = _kiroshop_get(f"{KIROSHOP_BASE}/products", token)
+                stock = sum(p.get("stock", 0) for p in products)
+            except Exception as e:
+                _ar_log(f"获取库存失败: {e}")
+                await asyncio.sleep(interval)
+                continue
+
+            state["stock"] = stock
+            state["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if stock == 0:
+                await asyncio.sleep(interval)
+                continue
+
+            # 有库存，立即并行换号
+            pending = list(state["pending_tasks"])
+            _ar_log(f"库存 {stock}，执行 {len(pending)} 个换号")
+            loop = asyncio.get_event_loop()
+            succeeded = set()
+            with ThreadPoolExecutor(max_workers=min(len(pending), 10)) as pool:
+                futs = {
+                    loop.run_in_executor(pool, _try_replace_sync, t["order_id"], t["delivery_id"], token): t
+                    for t in pending
+                }
+                for coro in asyncio.as_completed(futs):
+                    oid, did, code, detail = await coro
+                    if code == 200:
+                        replaced = detail.get("replaced_count", "?") if isinstance(detail, dict) else "?"
+                        _ar_log(f"订单{oid}/发货{did}: 替换 {replaced} 个")
+                        succeeded.add((oid, did))
+                    elif "库存不足" in str(detail):
+                        _ar_log(f"订单{oid}/发货{did}: 库存不足")
+                    elif "质保期" in str(detail):
+                        _ar_log(f"订单{oid}/发货{did}: 已超质保期，移除")
+                        succeeded.add((oid, did))
+                    else:
+                        _ar_log(f"订单{oid}/发货{did}: [{code}] {detail}")
+
+            # 移除成功的
+            state["pending_tasks"] = [
+                t for t in state["pending_tasks"]
+                if (t["order_id"], t["delivery_id"]) not in succeeded
+            ]
+
+            if not state["pending_tasks"]:
+                _ar_log("所有补号任务完成!")
+                break
+
+            _ar_log(f"剩余待补号: {len(state['pending_tasks'])}")
+            await asyncio.sleep(interval)
+
+    except asyncio.CancelledError:
+        _ar_log("自动补号已停止")
+    except Exception as e:
+        _ar_log(f"自动补号异常: {e}")
+    finally:
+        state["running"] = False
+
+
+async def start_auto_replace(request: Request) -> JSONResponse:
+    state = _auto_replace_state
+    if state["running"]:
+        return JSONResponse(content={"success": False, "message": "已在运行中"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    state["interval"] = body.get("interval", 1)
+
+    state["running"] = True
+    state["logs"] = []
+    state["pending_tasks"] = []
+    state["stock"] = 0
+    state["task"] = asyncio.create_task(_auto_replace_loop())
+    return JSONResponse(content={"success": True})
+
+
+async def stop_auto_replace(request: Request) -> JSONResponse:
+    state = _auto_replace_state
+    if not state["running"]:
+        return JSONResponse(content={"success": False, "message": "未在运行"})
+    state["running"] = False
+    task = state.get("task")
+    if task and not task.done():
+        task.cancel()
+    state["task"] = None
+    _ar_log("收到停止指令")
+    return JSONResponse(content={"success": True})
+
+
+async def get_auto_replace_status(request: Request) -> JSONResponse:
+    state = _auto_replace_state
+    return JSONResponse(content={
+        "running": state["running"],
+        "pending_tasks": state["pending_tasks"],
+        "stock": state["stock"],
+        "interval": state["interval"],
+        "last_check": state["last_check"],
+        "logs": state["logs"][-100:],
+    })
