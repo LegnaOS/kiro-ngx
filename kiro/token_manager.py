@@ -364,6 +364,12 @@ class _CredentialEntry:
     success_count: int = 0
     last_used_at: Optional[str] = None
     session_count: int = 0  # 本次运行的成功次数，重启归零
+    balance_score: int = 0  # 均衡点数（实时计算：per_cred_rpm - time_decay）
+    _request_ts: list = None  # 单凭据请求时间戳（用于计算单独 RPM）
+
+    def __post_init__(self):
+        if self._request_ts is None:
+            self._request_ts = []
 
 
 @dataclass
@@ -384,6 +390,9 @@ class CredentialEntrySnapshot:
     has_proxy: bool
     proxy_url: Optional[str] = None
     subscription_title: Optional[str] = None
+    balance_score: int = 0
+    balance_decay: int = 0   # 时间减益分量
+    balance_rpm: int = 0     # 单凭据 RPM 分量
 
     def to_dict(self) -> dict:
         d = {
@@ -394,6 +403,9 @@ class CredentialEntrySnapshot:
             "successCount": self.success_count, "sessionCount": self.session_count,
             "lastUsedAt": self.last_used_at, "hasProxy": self.has_proxy,
             "subscriptionTitle": self.subscription_title,
+            "balanceScore": self.balance_score,
+            "balanceDecay": self.balance_decay,
+            "balanceRpm": self.balance_rpm,
         }
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url
@@ -560,31 +572,32 @@ class MultiTokenManager:
                     return True
         return False
 
-    def _calculate_credential_score(self, entry: "_CredentialEntry", now: float) -> float:
-        """计算凭据评分（参考 AIClient-2-API 的动态均衡策略）
+    def _calculate_credential_score(self, entry: "_CredentialEntry") -> int:
+        """实时计算均衡点数 = per_cred_rpm - time_decay，越小越优先
 
-        评分 = 时间因子 - 负载因子
-        - 时间因子：距离上次使用的秒数（越久未用分数越低，优先选择）
-        - 负载因子：使用次数 * 10（使用越多分数越高，避免过载）
-
-        返回值越小越优先选择
+        RPM 活跃期间 decay 为 0；RPM 归零后 decay 从最后一次请求开始累积
         """
-        # 时间因子：距离上次使用的秒数
-        if entry.last_used_at:
+        now = time.time()
+        # 单凭据 RPM：最近 60 秒内的请求数
+        cutoff = now - 60
+        entry._request_ts = [t for t in entry._request_ts if t > cutoff]
+        cred_rpm = len(entry._request_ts)
+        # 时间减益：仅在 RPM 为 0 时才从 last_used_at 开始累积
+        if cred_rpm > 0:
+            decay = 0
+        elif entry.last_used_at:
             try:
-                last_used_ts = datetime.fromisoformat(entry.last_used_at.replace('Z', '+00:00')).timestamp()
-                time_since_last_use = now - last_used_ts
-            except (ValueError, AttributeError):
-                time_since_last_use = 0
+                last = datetime.fromisoformat(entry.last_used_at.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+                # 减去 60 秒的 RPM 窗口，RPM 窗口内不计 decay
+                decay = max(0, min(int((elapsed - 60) / 5), 100))
+            except Exception:
+                decay = 0
         else:
-            time_since_last_use = now  # 从未使用过，时间因子最大
-
-        # 负载因子：使用次数惩罚（乘以 10 增加权重）
-        load_penalty = entry.session_count * 10
-
-        # 评分 = 时间差（秒）- 负载惩罚
-        # 结果：越久未用且使用次数少的凭据，分数越低（越优先）
-        return time_since_last_use - load_penalty
+            decay = 0
+        score = max(-100, min(100, cred_rpm - decay))
+        entry.balance_score = score
+        return score
 
     def _select_next_credential(self, model: Optional[str] = None) -> Optional[tuple[int, KiroCredentials]]:
         """根据动态均衡 + 分组路由选择下一个凭据（需在 _lock 内调用）"""
@@ -602,12 +615,10 @@ class MultiTokenManager:
             if self._model_is_free(model):
                 free_creds = [e for e in available if self._groups.get(e.id) == "free"]
                 if free_creds:
-                    # 使用评分系统选择 free 组凭据
-                    now = time.time()
                     entry = min(free_creds, key=lambda e: (
-                        self._calculate_credential_score(e, now),
+                        self._calculate_credential_score(e),
                         e.credentials.priority,
-                        e.id  # UUID 排序确保确定性
+                        e.id
                     ))
                     logger.debug("模型 %s 路由到 free 组凭据 #%d", model, entry.id)
                     return (entry.id, entry.credentials.clone())
@@ -618,12 +629,11 @@ class MultiTokenManager:
                 if non_free:
                     available = non_free
 
-        # 动态均衡：LRU + 负载均衡 + 优先级
-        now = time.time()
+        # 动态均衡 + 优先级
         entry = min(available, key=lambda e: (
-            self._calculate_credential_score(e, now),
+            self._calculate_credential_score(e),
             e.credentials.priority,
-            e.id  # UUID 排序确保确定性
+            e.id
         ))
         return (entry.id, entry.credentials.clone())
 
@@ -742,6 +752,7 @@ class MultiTokenManager:
                     e.failure_count = 0
                     e.success_count += 1
                     e.session_count += 1
+                    e._request_ts.append(now)
                     e.last_used_at = _utc_now().isoformat()
                     logger.debug("凭据 #%d API 调用成功（本次 %d / 累计 %d）", cid, e.session_count, e.success_count)
                     break
@@ -850,10 +861,29 @@ class MultiTokenManager:
         with self._lock:
             available = sum(1 for e in self._entries if not e.disabled)
             snap_entries = []
+            now_ts = time.time()
             for e in self._entries:
                 am = e.credentials.auth_method
                 if am and am.lower() in ("builder-id", "iam"):
                     am = "idc"
+                # 实时计算均衡分量
+                cutoff = now_ts - 60
+                e._request_ts = [t for t in e._request_ts if t > cutoff]
+                cred_rpm = len(e._request_ts)
+                # RPM 活跃期间 decay 为 0；RPM 归零后从 last_used_at + 60s 开始累积
+                if cred_rpm > 0:
+                    decay = 0
+                elif e.last_used_at:
+                    try:
+                        last = datetime.fromisoformat(e.last_used_at.replace("Z", "+00:00"))
+                        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+                        decay = max(0, min(int((elapsed - 60) / 5), 100))
+                    except Exception:
+                        decay = 0
+                else:
+                    decay = 0
+                score = max(-100, min(100, cred_rpm - decay))
+                e.balance_score = score
                 snap_entries.append(CredentialEntrySnapshot(
                     id=e.id,
                     priority=e.credentials.priority,
@@ -870,6 +900,9 @@ class MultiTokenManager:
                     has_proxy=e.credentials.proxy_url is not None,
                     proxy_url=e.credentials.proxy_url,
                     subscription_title=e.credentials.subscription_title,
+                    balance_score=score if not e.disabled else 0,
+                    balance_decay=decay if not e.disabled else 0,
+                    balance_rpm=cred_rpm if not e.disabled else 0,
                 ))
             return ManagerSnapshot(
                 entries=snap_entries,
@@ -903,6 +936,23 @@ class MultiTokenManager:
             entry.disabled = False
             entry.disabled_reason = None
         self.persist_credentials()
+
+    def reset_all_counters(self):
+        """重置所有凭据的均衡点数、会话计数、成功计数、失败计数"""
+        with self._lock:
+            for e in self._entries:
+                e.balance_score = 0
+                e._request_ts.clear()
+                e.session_count = 0
+                e.success_count = 0
+                e.failure_count = 0
+                e.last_used_at = None
+            self._request_timestamps.clear()
+            self._peak_rpm = 0
+            self._model_call_counts.clear()
+            self._model_cred_counts.clear()
+        self.persist_credentials()
+        self.save_stats()
 
     async def get_usage_limits_for(self, cid: int) -> UsageLimitsResponse:
         """获取指定凭据的使用额度"""

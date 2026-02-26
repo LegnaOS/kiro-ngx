@@ -94,6 +94,12 @@ export async function setCredentialGroups(groups: Record<number, string>): Promi
   return data
 }
 
+// 重置所有凭据计数器
+export async function resetAllCounters(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/reset-all')
+  return data
+}
+
 // 读取 credentials.json 原始内容
 export async function getRawCredentials(): Promise<{ content: string }> {
   const { data } = await api.get<{ content: string }>('/credentials-raw')

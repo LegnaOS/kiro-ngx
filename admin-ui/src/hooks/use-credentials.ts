@@ -16,7 +16,7 @@ export function useCredentials() {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000,
+    refetchInterval: 3000,
   })
 }
 

@@ -3,6 +3,7 @@ export interface CredentialsStatusResponse {
   total: number
   available: number
   currentId: number
+  rpm: number
   credentials: CredentialStatusItem[]
 }
 
@@ -26,6 +27,8 @@ export interface CredentialStatusItem {
   subscriptionTitle: string | null
   group: 'free' | 'pro' | 'priority' | null
   balanceScore: number | null  // 动态均衡评分（越低越优先）
+  balanceDecay: number | null  // 时间减益分量
+  balanceRpm: number | null    // 单凭据 RPM 分量
 }
 
 // 余额响应

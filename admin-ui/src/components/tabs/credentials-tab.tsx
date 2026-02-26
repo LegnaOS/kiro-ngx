@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
-import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, GripVertical } from 'lucide-react'
+import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, GripVertical, ListRestart } from 'lucide-react'
 import { DndContext, closestCenter, DragOverlay, useDroppable, useDraggable, type DragEndEvent, type DragStartEvent, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
 import { toast } from 'sonner'
 import { Card, CardContent } from '@/components/ui/card'
@@ -12,7 +12,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { CredentialsEditorDialog } from '@/components/credentials-editor-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialGroups } from '@/api/credentials'
+import { getCredentialBalance, setCredentialGroups, resetAllCounters, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
@@ -123,7 +123,7 @@ export function CredentialsTab() {
     if (ids.length === 0) { toast.error('没有可查询的启用凭据'); return }
     setQueryingInfo(true)
     setQueryInfoProgress({ current: 0, total: ids.length })
-    let ok = 0, fail = 0
+    let ok = 0, fail = 0, autoDisabled = 0
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i]
       setLoadingBalanceIds(prev => new Set(prev).add(id))
@@ -131,13 +131,22 @@ export function CredentialsTab() {
         const balance = await getCredentialBalance(id)
         ok++
         setBalanceMap(prev => new Map(prev).set(id, balance))
-      } catch { fail++ }
+      } catch (err: unknown) {
+        fail++
+        // 仅凭据本身无效（4xx）时自动禁用，网络/服务端错误不禁用
+        const status = (err as { response?: { status?: number } })?.response?.status
+        if (status && status >= 400 && status < 500) {
+          try { await setCredentialDisabled(id, true); autoDisabled++ }
+          catch { /* 禁用失败忽略 */ }
+        }
+      }
       finally { setLoadingBalanceIds(prev => { const n = new Set(prev); n.delete(id); return n }) }
       setQueryInfoProgress({ current: i + 1, total: ids.length })
     }
     setQueryingInfo(false)
     refetch()
-    toast[fail === 0 ? 'success' : 'warning'](`查询：成功 ${ok}/${ids.length}`)
+    const msg = `查询：成功 ${ok}/${ids.length}` + (autoDisabled > 0 ? `，已自动禁用 ${autoDisabled} 个` : '')
+    toast[fail === 0 ? 'success' : 'warning'](msg)
   }
 
   // 批量验活
@@ -182,13 +191,21 @@ export function CredentialsTab() {
 
   // 拖拽
   const [draggingId, setDraggingId] = useState<number | null>(null)
+  const [draggingWidth, setDraggingWidth] = useState<number>(0)
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }))
   const draggingCredential = useMemo(() => {
     if (!draggingId || !data?.credentials) return null
     return data.credentials.find(c => c.id === draggingId) || null
   }, [draggingId, data?.credentials])
 
-  const handleDragStart = (e: DragStartEvent) => setDraggingId(e.active.id as number)
+  const dragNodeRefs = useRef<Map<number, HTMLDivElement>>(new Map())
+
+  const handleDragStart = (e: DragStartEvent) => {
+    const id = e.active.id as number
+    setDraggingId(id)
+    const el = dragNodeRefs.current.get(id)
+    if (el) setDraggingWidth(el.getBoundingClientRect().width)
+  }
   const handleDragEnd = (e: DragEndEvent) => {
     setDraggingId(null)
     const { active, over } = e
@@ -242,6 +259,12 @@ export function CredentialsTab() {
                 <RefreshCw className={`h-4 w-4 mr-1 ${queryingInfo ? 'animate-spin' : ''}`} />
                 {queryingInfo ? `${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
               </Button>
+              <Button onClick={async () => {
+                try { const res = await resetAllCounters(); toast.success(res.message); await refetch() }
+                catch { toast.error('重置失败') }
+              }} size="sm" variant="outline">
+                <ListRestart className="h-4 w-4 mr-1" />重置均衡
+              </Button>
               <Button onClick={handleClearAll} size="sm" variant="outline" className="text-destructive hover:text-destructive" disabled={disabledCredentialCount === 0}>
                 <Trash2 className="h-4 w-4 mr-1" />清除已禁用
               </Button>
@@ -268,27 +291,30 @@ export function CredentialsTab() {
               {groupedCredentials.priority.map(c => (
                 <DraggableCredentialCard key={c.id} credential={c} onViewBalance={handleViewBalance}
                   selected={selectedIds.has(c.id)} onToggleSelect={() => toggleSelect(c.id)}
-                  balance={balanceMap.get(c.id) || null} loadingBalance={loadingBalanceIds.has(c.id)} />
+                  balance={balanceMap.get(c.id) || null} loadingBalance={loadingBalanceIds.has(c.id)}
+                  nodeRefs={dragNodeRefs} />
               ))}
             </GroupDropZone>
             <GroupDropZone id="pro" label="Pro" color="blue" count={groupedCredentials.pro.length}>
               {groupedCredentials.pro.map(c => (
                 <DraggableCredentialCard key={c.id} credential={c} onViewBalance={handleViewBalance}
                   selected={selectedIds.has(c.id)} onToggleSelect={() => toggleSelect(c.id)}
-                  balance={balanceMap.get(c.id) || null} loadingBalance={loadingBalanceIds.has(c.id)} />
+                  balance={balanceMap.get(c.id) || null} loadingBalance={loadingBalanceIds.has(c.id)}
+                  nodeRefs={dragNodeRefs} />
               ))}
             </GroupDropZone>
             <GroupDropZone id="free" label="免费" color="gray" count={groupedCredentials.free.length}>
               {groupedCredentials.free.map(c => (
                 <DraggableCredentialCard key={c.id} credential={c} onViewBalance={handleViewBalance}
                   selected={selectedIds.has(c.id)} onToggleSelect={() => toggleSelect(c.id)}
-                  balance={balanceMap.get(c.id) || null} loadingBalance={loadingBalanceIds.has(c.id)} draggable={false} />
+                  balance={balanceMap.get(c.id) || null} loadingBalance={loadingBalanceIds.has(c.id)} draggable={false}
+                  nodeRefs={dragNodeRefs} />
               ))}
             </GroupDropZone>
           </div>
-          <DragOverlay>
+          <DragOverlay dropAnimation={null}>
             {draggingCredential ? (
-              <div className="opacity-80 w-[350px]">
+              <div className="opacity-90" style={{ width: draggingWidth || undefined }}>
                 <CredentialCard credential={draggingCredential} onViewBalance={() => {}}
                   selected={false} onToggleSelect={() => {}}
                   balance={balanceMap.get(draggingCredential.id) || null} loadingBalance={false} />
@@ -339,18 +365,23 @@ function GroupDropZone({ id, label, color, count, children }: {
 }
 
 // 可拖拽凭据卡片
-function DraggableCredentialCard({ credential, draggable = true, ...props }: {
+function DraggableCredentialCard({ credential, draggable = true, nodeRefs, ...props }: {
   credential: CredentialStatusItem; onViewBalance: (id: number) => void
   selected: boolean; onToggleSelect: () => void
   balance: BalanceResponse | null; loadingBalance: boolean; draggable?: boolean
+  nodeRefs: React.MutableRefObject<Map<number, HTMLDivElement>>
 }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: credential.id, disabled: !draggable })
-  const style = transform ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` } : undefined
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: credential.id, disabled: !draggable })
+  const combinedRef = (el: HTMLDivElement | null) => {
+    setNodeRef(el)
+    if (el) nodeRefs.current.set(credential.id, el)
+    else nodeRefs.current.delete(credential.id)
+  }
   return (
-    <div ref={setNodeRef} style={style} className={`relative ${isDragging ? 'opacity-30' : ''}`}>
+    <div ref={combinedRef} className={`relative ${isDragging ? 'opacity-30' : ''}`}>
       {draggable && (
-        <div {...listeners} {...attributes} className="absolute top-3 right-3 z-10 cursor-grab active:cursor-grabbing p-1 rounded hover:bg-muted">
-          <GripVertical className="h-4 w-4 text-muted-foreground" />
+        <div {...listeners} {...attributes} className="absolute -top-1.5 left-1/2 -translate-x-1/2 z-10 cursor-grab active:cursor-grabbing px-2 py-0.5 rounded-b bg-muted/80 hover:bg-muted">
+          <GripVertical className="h-3.5 w-3.5 text-muted-foreground rotate-90" />
         </div>
       )}
       <CredentialCard credential={credential} {...props} />

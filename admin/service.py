@@ -66,26 +66,10 @@ class AdminService:
             else:
                 group = "pro"
 
-            # 计算动态均衡评分（调用 token_manager 的评分方法）
-            balance_score = None
-            if not entry.disabled:
-                try:
-                    # 构造一个临时的 _CredentialEntry 对象用于评分计算
-                    from kiro.token_manager import _CredentialEntry
-                    temp_entry = _CredentialEntry(
-                        id=entry.id,
-                        credentials=None,  # 评分不需要 credentials 对象
-                        priority=entry.priority,
-                        disabled=entry.disabled,
-                        failure_count=entry.failure_count,
-                        success_count=entry.success_count,
-                        session_count=entry.session_count,
-                        last_used_at=entry.last_used_at,
-                        disabled_reason=None,
-                    )
-                    balance_score = self.token_manager._calculate_credential_score(temp_entry, now)
-                except Exception as e:
-                    logger.debug(f"计算凭据 #{entry.id} 评分失败: {e}")
+            # 均衡分量直接从 snapshot 读取
+            balance_score = entry.balance_score if not entry.disabled else None
+            balance_decay = entry.balance_decay if not entry.disabled else None
+            balance_rpm = entry.balance_rpm if not entry.disabled else None
 
             credentials.append(CredentialStatusItem(
                 id=entry.id,
@@ -106,14 +90,18 @@ class AdminService:
                 subscription_title=sub_title,
                 group=group,
                 balance_score=balance_score,
+                balance_decay=balance_decay,
+                balance_rpm=balance_rpm,
             ))
+
         credentials.sort(key=lambda c: c.priority)
-        # 同步分组到 token_manager 用于路由
         self._sync_groups_to_manager()
+        stats = self.token_manager.get_stats()
         return CredentialsStatusResponse(
             total=snapshot.total,
             available=snapshot.available,
             current_id=snapshot.current_id,
+            rpm=stats.get("rpm", 0),
             credentials=credentials,
         )
 
@@ -145,6 +133,10 @@ class AdminService:
             self.token_manager.reset_and_enable(id)
         except Exception as e:
             raise self._classify_error(e, id)
+
+    def reset_all_counters(self) -> None:
+        """重置所有凭据的均衡点数和计数器"""
+        self.token_manager.reset_all_counters()
 
     async def get_balance(self, id: int) -> BalanceResponse:
         """获取凭据余额（带缓存）"""

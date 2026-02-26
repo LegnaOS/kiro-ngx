@@ -67,6 +67,14 @@ async def reset_failure_count(request: Request, id: int) -> JSONResponse:
     )
 
 
+async def reset_all_counters(request: Request) -> JSONResponse:
+    """POST /credentials/reset-all"""
+    service = request.app.state.admin_service
+    service.reset_all_counters()
+    return JSONResponse(
+        content=SuccessResponse.new("所有凭据计数器已重置").to_dict()
+    )
+
 async def get_credential_balance(request: Request, id: int) -> JSONResponse:
     """GET /credentials/{id}/balance"""
     service = request.app.state.admin_service

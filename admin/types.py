@@ -26,7 +26,9 @@ class CredentialStatusItem:
     proxy_url: Optional[str] = None
     subscription_title: Optional[str] = None
     group: Optional[str] = None  # "free" | "pro" | "priority"
-    balance_score: Optional[float] = None  # 动态均衡评分（越低越优先）
+    balance_score: Optional[int] = None  # 均衡点数（-100 ~ 100）
+    balance_decay: Optional[int] = None  # 时间减益分量
+    balance_rpm: Optional[int] = None    # 单凭据 RPM 分量
 
     def to_dict(self) -> dict:
         d = {
@@ -47,6 +49,8 @@ class CredentialStatusItem:
             "subscriptionTitle": self.subscription_title,
             "group": self.group,
             "balanceScore": self.balance_score,
+            "balanceDecay": self.balance_decay,
+            "balanceRpm": self.balance_rpm,
         }
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url
@@ -59,6 +63,7 @@ class CredentialsStatusResponse:
     total: int = 0
     available: int = 0
     current_id: int = 0
+    rpm: int = 0
     credentials: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -66,6 +71,7 @@ class CredentialsStatusResponse:
             "total": self.total,
             "available": self.available,
             "currentId": self.current_id,
+            "rpm": self.rpm,
             "credentials": [c.to_dict() for c in self.credentials],
         }
 
