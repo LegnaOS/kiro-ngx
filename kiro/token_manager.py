@@ -519,6 +519,30 @@ class MultiTokenManager:
 
         self.load_stats()
 
+    def _compute_balance(self, e: "_CredentialEntry", now: float) -> tuple:
+        """实时计算均衡三元组 (score, cred_rpm, decay)，保证 score = rpm - decay"""
+        cutoff = now - 60
+        e._request_ts = [t for t in e._request_ts if t > cutoff]
+        cred_rpm = len(e._request_ts)
+        # decay：空闲秒数 / 5，活跃期间为 0
+        if cred_rpm > 0 or not e.last_used_at:
+            decay = 0
+        else:
+            try:
+                last = datetime.fromisoformat(e.last_used_at.replace("Z", "+00:00"))
+                idle = max(0, (datetime.now(timezone.utc) - last).total_seconds())
+                decay = min(int(idle / 5), 100)
+            except Exception:
+                decay = 0
+        score = max(-100, min(100, cred_rpm - decay))
+        e.balance_score = score
+        return score, cred_rpm, decay
+
+    def _calculate_credential_score(self, entry: "_CredentialEntry") -> int:
+        """返回凭据均衡点数，越小越优先"""
+        score, _, _ = self._compute_balance(entry, time.time())
+        return score
+
     def config(self) -> Config:
         return self._config
 
@@ -571,33 +595,6 @@ class MultiTokenManager:
                 if ("thinking" in ml) == ("thinking" in fl):
                     return True
         return False
-
-    def _calculate_credential_score(self, entry: "_CredentialEntry") -> int:
-        """实时计算均衡点数 = per_cred_rpm - time_decay，越小越优先
-
-        RPM 活跃期间 decay 为 0；RPM 归零后 decay 从最后一次请求开始累积
-        """
-        now = time.time()
-        # 单凭据 RPM：最近 60 秒内的请求数
-        cutoff = now - 60
-        entry._request_ts = [t for t in entry._request_ts if t > cutoff]
-        cred_rpm = len(entry._request_ts)
-        # 时间减益：仅在 RPM 为 0 时才从 last_used_at 开始累积
-        if cred_rpm > 0:
-            decay = 0
-        elif entry.last_used_at:
-            try:
-                last = datetime.fromisoformat(entry.last_used_at.replace("Z", "+00:00"))
-                elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-                # 减去 60 秒的 RPM 窗口，RPM 窗口内不计 decay
-                decay = max(0, min(int((elapsed - 60) / 5), 100))
-            except Exception:
-                decay = 0
-        else:
-            decay = 0
-        score = max(-100, min(100, cred_rpm - decay))
-        entry.balance_score = score
-        return score
 
     def _select_next_credential(self, model: Optional[str] = None) -> Optional[tuple[int, KiroCredentials]]:
         """根据动态均衡 + 分组路由选择下一个凭据（需在 _lock 内调用）"""
@@ -866,24 +863,8 @@ class MultiTokenManager:
                 am = e.credentials.auth_method
                 if am and am.lower() in ("builder-id", "iam"):
                     am = "idc"
-                # 实时计算均衡分量
-                cutoff = now_ts - 60
-                e._request_ts = [t for t in e._request_ts if t > cutoff]
-                cred_rpm = len(e._request_ts)
-                # RPM 活跃期间 decay 为 0；RPM 归零后从 last_used_at + 60s 开始累积
-                if cred_rpm > 0:
-                    decay = 0
-                elif e.last_used_at:
-                    try:
-                        last = datetime.fromisoformat(e.last_used_at.replace("Z", "+00:00"))
-                        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-                        decay = max(0, min(int((elapsed - 60) / 5), 100))
-                    except Exception:
-                        decay = 0
-                else:
-                    decay = 0
-                score = max(-100, min(100, cred_rpm - decay))
-                e.balance_score = score
+                # 用统一方法计算均衡三元组
+                score, cred_rpm, decay = self._compute_balance(e, now_ts)
                 snap_entries.append(CredentialEntrySnapshot(
                     id=e.id,
                     priority=e.credentials.priority,
