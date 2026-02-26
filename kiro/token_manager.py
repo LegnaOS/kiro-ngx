@@ -393,6 +393,7 @@ class CredentialEntrySnapshot:
     balance_score: int = 0
     balance_decay: int = 0   # 时间减益分量
     balance_rpm: int = 0     # 单凭据 RPM 分量
+    disabled_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -884,6 +885,7 @@ class MultiTokenManager:
                     balance_score=score if not e.disabled else 0,
                     balance_decay=decay if not e.disabled else 0,
                     balance_rpm=cred_rpm if not e.disabled else 0,
+                    disabled_reason=e.disabled_reason,
                 ))
             return ManagerSnapshot(
                 entries=snap_entries,

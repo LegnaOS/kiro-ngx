@@ -29,6 +29,7 @@ class CredentialStatusItem:
     balance_score: Optional[int] = None  # 均衡点数（-100 ~ 100）
     balance_decay: Optional[int] = None  # 时间减益分量
     balance_rpm: Optional[int] = None    # 单凭据 RPM 分量
+    disabled_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -51,6 +52,7 @@ class CredentialStatusItem:
             "balanceScore": self.balance_score,
             "balanceDecay": self.balance_decay,
             "balanceRpm": self.balance_rpm,
+            "disabledReason": self.disabled_reason,
         }
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url

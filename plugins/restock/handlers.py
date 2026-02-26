@@ -639,3 +639,156 @@ async def get_auto_replace_status(request: Request) -> JSONResponse:
         "last_check": state["last_check"],
         "logs": state["logs"][-100:],
     })
+
+
+# --- 自动补货（监控异常禁用凭据 → 触发补货流程）---
+
+_auto_restock_state: dict = {
+    "running": False,
+    "task": None,
+    "app": None,
+    "interval": 30,
+    "disabled_creds": [],
+    "logs": [],
+}
+
+
+def _restock_log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    _auto_restock_state["logs"].append(line)
+    if len(_auto_restock_state["logs"]) > _MAX_LOGS:
+        _auto_restock_state["logs"] = _auto_restock_state["logs"][-_MAX_LOGS:]
+    logger.info(f"[auto-restock] {msg}")
+
+
+def _get_abnormal_disabled_creds(app) -> list[dict]:
+    """获取 pro/priority 分组中异常禁用的凭据"""
+    service = app.state.admin_service
+    resp = service.get_all_credentials()
+    result = []
+    for c in resp.credentials:
+        if not c.disabled:
+            continue
+        if c.disabled_reason not in ("too_many_failures", "quota_exceeded"):
+            continue
+        if c.group not in ("pro", "priority"):
+            continue
+        result.append({
+            "id": c.id, "email": c.email,
+            "group": c.group, "reason": c.disabled_reason,
+        })
+    return result
+
+
+async def _auto_restock_loop():
+    """持续监控异常禁用凭据，发现后触发补货流程"""
+    state = _auto_restock_state
+    app = state["app"]
+
+    _restock_log("自动补货已启动")
+
+    try:
+        while state["running"]:
+            interval = state["interval"]
+
+            try:
+                abnormal = _get_abnormal_disabled_creds(app)
+            except Exception as e:
+                _restock_log(f"获取凭据状态失败: {e}")
+                await asyncio.sleep(interval)
+                continue
+
+            state["disabled_creds"] = abnormal
+
+            if not abnormal:
+                await asyncio.sleep(interval)
+                continue
+
+            emails = ", ".join(c["email"] or f"#{c['id']}" for c in abnormal)
+            _restock_log(f"检测到 {len(abnormal)} 个异常禁用凭据: {emails}")
+
+            # 补货流程已在运行则跳过
+            if _auto_replace_state["running"]:
+                _restock_log("补货流程已在运行中，跳过")
+                await asyncio.sleep(interval)
+                continue
+
+            cfg = {}
+            if _CONFIG_PATH.exists():
+                try:
+                    cfg = json.loads(_CONFIG_PATH.read_text("utf-8"))
+                except Exception:
+                    pass
+            token = cfg.get("token", "")
+            if not token:
+                _restock_log("无 kiroshop token，无法补货")
+                await asyncio.sleep(interval)
+                continue
+
+            _restock_log("启动补货流程...")
+            _auto_replace_state["running"] = True
+            _auto_replace_state["logs"] = []
+            _auto_replace_state["pending_tasks"] = []
+            _auto_replace_state["stock"] = 0
+            _auto_replace_state["interval"] = 1
+            _auto_replace_state["task"] = asyncio.create_task(_auto_replace_loop())
+
+            # 等待补货完成
+            replace_task = _auto_replace_state["task"]
+            if replace_task:
+                try:
+                    await replace_task
+                except Exception as e:
+                    _restock_log(f"补货流程异常: {e}")
+
+            _restock_log("补货流程结束，继续监控...")
+            await asyncio.sleep(interval)
+
+    except asyncio.CancelledError:
+        _restock_log("自动补货已停止")
+    except Exception as e:
+        _restock_log(f"自动补货异常: {e}")
+    finally:
+        state["running"] = False
+
+
+async def start_auto_restock(request: Request) -> JSONResponse:
+    state = _auto_restock_state
+    if state["running"]:
+        return JSONResponse(content={"success": False, "message": "已在运行中"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    state["interval"] = body.get("interval", 30)
+    state["app"] = request.app
+    state["running"] = True
+    state["logs"] = []
+    state["disabled_creds"] = []
+    state["task"] = asyncio.create_task(_auto_restock_loop())
+    return JSONResponse(content={"success": True})
+
+
+async def stop_auto_restock(request: Request) -> JSONResponse:
+    state = _auto_restock_state
+    if not state["running"]:
+        return JSONResponse(content={"success": False, "message": "未在运行"})
+    state["running"] = False
+    task = state.get("task")
+    if task and not task.done():
+        task.cancel()
+    state["task"] = None
+    _restock_log("收到停止指令")
+    return JSONResponse(content={"success": True})
+
+
+async def get_auto_restock_status(request: Request) -> JSONResponse:
+    state = _auto_restock_state
+    return JSONResponse(content={
+        "running": state["running"],
+        "disabled_creds": state["disabled_creds"],
+        "interval": state["interval"],
+        "logs": state["logs"][-100:],
+    })

@@ -149,3 +149,23 @@ export async function getAutoReplaceStatus() {
   }>('/plugins/restock/auto-replace/status')
   return data
 }
+
+// 自动补货控制
+export async function startAutoRestock(interval: number = 30) {
+  const { data } = await api.post<{ success: boolean; message?: string }>('/plugins/restock/auto-restock/start', { interval })
+  return data
+}
+
+export async function stopAutoRestock() {
+  const { data } = await api.post<{ success: boolean; message?: string }>('/plugins/restock/auto-restock/stop')
+  return data
+}
+
+export async function getAutoRestockStatus() {
+  const { data } = await api.get<{
+    running: boolean
+    disabled_creds: Array<{ id: number; email: string | null; group: string; reason: string }>
+    interval: number; logs: string[]
+  }>('/plugins/restock/auto-restock/status')
+  return data
+}

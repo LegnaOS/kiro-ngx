@@ -92,6 +92,7 @@ class AdminService:
                 balance_score=balance_score,
                 balance_decay=balance_decay,
                 balance_rpm=balance_rpm,
+                disabled_reason=entry.disabled_reason,
             ))
 
         credentials.sort(key=lambda c: c.priority)

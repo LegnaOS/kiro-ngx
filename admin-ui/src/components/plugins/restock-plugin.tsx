@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Package, ShoppingCart, FileText, ShieldAlert, Loader2, Search, Copy, Download, ChevronDown, ChevronRight, Play, Square, RefreshCw, RotateCcw, Plus, X } from 'lucide-react'
+import { Package, ShoppingCart, FileText, ShieldAlert, Loader2, Search, Copy, Download, ChevronDown, ChevronRight, Play, Square, RefreshCw, RotateCcw, Plus, X, Power } from 'lucide-react'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -12,6 +12,7 @@ import {
   getRestockConfig, saveRestockConfig, type RestockConfig,
   restockDeliver, restockBatchReplace, analyzeRestockOrders,
   startAutoReplace, stopAutoReplace, getAutoReplaceStatus,
+  startAutoRestock, stopAutoRestock, getAutoRestockStatus,
 } from '@/api/plugins'
 
 const STATUS_MAP: Record<string, string> = {
@@ -21,8 +22,14 @@ const STATUS_MAP: Record<string, string> = {
 const DEFAULT_REGIONS = ['eu-north-1', 'us-east-1']
 
 async function sha256Hex(text: string): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('')
+  if (crypto.subtle) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('')
+  }
+  // HTTP 环境下 crypto.subtle 不可用，用简单 hash 替代（仅用于 UI 比对）
+  let h = 0
+  for (let i = 0; i < text.length; i++) { h = ((h << 5) - h + text.charCodeAt(i)) | 0 }
+  return (h >>> 0).toString(16).padStart(8, '0')
 }
 
 export default function RestockPlugin() {
@@ -61,6 +68,11 @@ export default function RestockPlugin() {
   const [arLoading, setArLoading] = useState(false)
   const [arInterval, setArInterval] = useState('1')
   const arPollRef = useRef<ReturnType<typeof setInterval>>()
+  // 自动补货
+  const [restockStatus, setRestockStatus] = useState<any | null>(null)
+  const [restockLoading, setRestockLoading] = useState(false)
+  const [restockInterval, setRestockInterval] = useState('30')
+  const restockPollRef = useRef<ReturnType<typeof setInterval>>()
   // Region 列表
   const [regions, setRegions] = useState<string[]>([...DEFAULT_REGIONS])
   const [newRegion, setNewRegion] = useState('')
@@ -132,20 +144,24 @@ export default function RestockPlugin() {
     try {
       const [d, creds] = await Promise.all([
         getRestockOrderDetail(config.token, orderId),
-        getCredentials(),
+        getCredentials().catch(() => null),
       ])
       setDetail(d)
-      setCredHashSet(new Set(creds.credentials.map(c => c.refreshTokenHash).filter(Boolean) as string[]))
-      // 预计算所有 account 的 refresh_token hash（用同级字段）
-      const allRts: string[] = []
-      for (const del of d.deliveries || []) {
-        for (const a of del.account_data || []) {
-          const rt = a.refresh_token || ''
-          if (rt) allRts.push(rt)
-        }
+      if (creds) {
+        setCredHashSet(new Set(creds.credentials.map(c => c.refreshTokenHash).filter(Boolean) as string[]))
       }
-      const hashEntries = await Promise.all(allRts.map(async rt => [rt, await sha256Hex(rt)] as const))
-      setAccountHashMap(new Map(hashEntries))
+      // 预计算所有 account 的 refresh_token hash（用同级字段）
+      try {
+        const allRts: string[] = []
+        for (const del of d.deliveries || []) {
+          for (const a of del.account_data || []) {
+            const rt = a.refresh_token || ''
+            if (rt) allRts.push(rt)
+          }
+        }
+        const hashEntries = await Promise.all(allRts.map(async rt => [rt, await sha256Hex(rt)] as const))
+        setAccountHashMap(new Map(hashEntries))
+      } catch { /* hash 计算失败不影响详情展示 */ }
     } catch (e: any) {
       toast.error(e?.response?.data?.error || '订单详情查询失败')
       setExpandedOrderId(null)
@@ -164,45 +180,46 @@ export default function RestockPlugin() {
   // 导入发货批次凭据到系统（按 region 列表依次尝试）
   const handleImportDelivery = async (deliveryId: number, accountData: any[]) => {
     setImportingDeliveryId(deliveryId)
-    let success = 0
+    let success = 0, skipped = 0
     const errors: string[] = []
     for (const item of accountData) {
       const email = item.email || '(未知)'
       try {
-        // 凭据字段在 account_json 内部（JSON 数组字符串）
         const jsonArr = JSON.parse(item.account_json)
         const cred = Array.isArray(jsonArr) ? jsonArr[0] : jsonArr
         if (!cred) { errors.push(`${email}: account_json 为空`); continue }
         const refreshToken = cred.refreshToken || cred.refresh_token || ''
         if (!refreshToken) { errors.push(`${email}: 缺少 refreshToken`); continue }
+        // 跳过已存在的凭据
+        const hash = await sha256Hex(refreshToken)
+        if (credHashSet.has(hash)) { skipped++; continue }
         const clientId = (cred.clientId || cred.client_id || '').trim() || undefined
         const clientSecret = (cred.clientSecret || cred.client_secret || '').trim() || undefined
         const authMethod = (clientId && clientSecret) ? 'idc' as const : 'social' as const
-        const base = {
-          refreshToken,
-          authMethod,
-          clientId,
-          clientSecret,
-        }
+        const base = { refreshToken, authMethod, clientId, clientSecret }
         let ok = false
         let lastErr = ''
         for (const region of regions) {
           try {
-            await addCredential({ ...base, authRegion: region, apiRegion: region })
+            await addCredential({ ...base, authRegion: region })
             ok = true
             break
           } catch (e: any) {
             lastErr = e?.response?.data?.error || e?.response?.data?.message || e?.message || String(e)
           }
         }
-        if (ok) success++; else errors.push(`${email}: ${lastErr}`)
+        if (ok) { success++; credHashSet.add(hash) } else errors.push(`${email}: ${lastErr}`)
       } catch (e: any) { errors.push(`${email}: ${e?.message || '解析失败'}`) }
     }
     setImportingDeliveryId(null)
+    const parts: string[] = []
+    if (success) parts.push(`成功 ${success}`)
+    if (skipped) parts.push(`跳过已存在 ${skipped}`)
+    if (errors.length) parts.push(`失败 ${errors.length}`)
     if (errors.length === 0) {
-      toast.success(`成功导入 ${success} 条凭据`)
+      toast.success(`导入完成: ${parts.join(', ')}`)
     } else {
-      toast.warning(`导入: 成功 ${success}, 失败 ${errors.length}`)
+      toast.warning(`导入完成: ${parts.join(', ')}`)
       for (const err of errors.slice(0, 5)) toast.error(err)
       if (errors.length > 5) toast.error(`...还有 ${errors.length - 5} 条失败`)
     }
@@ -284,6 +301,38 @@ export default function RestockPlugin() {
     arPollRef.current = setInterval(pollArStatus, ms)
     return () => { if (arPollRef.current) clearInterval(arPollRef.current) }
   }, [pollArStatus, arStatus?.running])
+
+  // 自动补货
+  const pollRestockStatus = useCallback(async () => {
+    try { setRestockStatus(await getAutoRestockStatus()) } catch {}
+  }, [])
+
+  const handleStartRestock = async () => {
+    setRestockLoading(true)
+    try {
+      await startAutoRestock(parseInt(restockInterval) || 30)
+      toast.success('自动补货已启动')
+      pollRestockStatus()
+    } catch (e: any) { toast.error(e?.response?.data?.error || '启动失败') }
+    finally { setRestockLoading(false) }
+  }
+
+  const handleStopRestock = async () => {
+    setRestockLoading(true)
+    try {
+      await stopAutoRestock()
+      toast.success('自动补货已停止')
+      pollRestockStatus()
+    } catch (e: any) { toast.error(e?.response?.data?.error || '停止失败') }
+    finally { setRestockLoading(false) }
+  }
+
+  useEffect(() => {
+    pollRestockStatus()
+    const ms = restockStatus?.running ? 5000 : 15000
+    restockPollRef.current = setInterval(pollRestockStatus, ms)
+    return () => { if (restockPollRef.current) clearInterval(restockPollRef.current) }
+  }, [pollRestockStatus, restockStatus?.running])
 
   if (!configLoaded) {
     return <div className="flex items-center justify-center py-12"><Loader2 className="h-6 w-6 animate-spin" /></div>
@@ -591,7 +640,7 @@ export default function RestockPlugin() {
                   </Button>
                 ) : (
                   <Button size="sm" onClick={handleStartAr} disabled={arLoading}>
-                    <Play className="h-4 w-4 mr-1" /> 启动
+                    <Play className="h-4 w-4 mr-1" /> 开始补货
                   </Button>
                 )}
               </div>
@@ -662,6 +711,74 @@ export default function RestockPlugin() {
                 <div className="text-xs font-medium">运行日志</div>
                 <div className="rounded border bg-muted/30 p-2 max-h-48 overflow-y-auto font-mono text-xs space-y-0.5">
                   {arStatus.logs.map((line: string, i: number) => (
+                    <div key={i} className="text-muted-foreground">{line}</div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* 自动补货 */}
+        <Card className="md:col-span-2">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-base flex items-center gap-2">
+                <Power className="h-4 w-4" /> 自动补货
+              </CardTitle>
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1">
+                  <span className="text-xs text-muted-foreground">检测间隔</span>
+                  <Input type="number" min="5" className="w-16 h-8 text-xs" value={restockInterval}
+                    onChange={e => setRestockInterval(e.target.value)} disabled={restockStatus?.running} />
+                  <span className="text-xs text-muted-foreground">秒</span>
+                </div>
+                {restockStatus?.running ? (
+                  <Button size="sm" variant="destructive" onClick={handleStopRestock} disabled={restockLoading}>
+                    <Square className="h-4 w-4 mr-1" /> 停止
+                  </Button>
+                ) : (
+                  <Button size="sm" onClick={handleStartRestock} disabled={restockLoading}>
+                    <Power className="h-4 w-4 mr-1" /> 启动
+                  </Button>
+                )}
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">监控 pro/priority 凭据异常禁用，自动触发补货流程</p>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex items-center gap-4 text-sm">
+              <Badge variant={restockStatus?.running ? 'success' : 'secondary'}>
+                {restockStatus?.running ? '监控中' : '已停止'}
+              </Badge>
+              {restockStatus?.disabled_creds && restockStatus.disabled_creds.length > 0 && (
+                <span className="text-muted-foreground">异常禁用: {restockStatus.disabled_creds.length} 个</span>
+              )}
+            </div>
+
+            {restockStatus?.disabled_creds && restockStatus.disabled_creds.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-xs font-medium">异常禁用凭据</div>
+                <div className="rounded border bg-background p-2 space-y-1 max-h-40 overflow-y-auto">
+                  {restockStatus.disabled_creds.map((c: any) => (
+                    <div key={c.id} className="flex items-center gap-3 text-xs py-0.5">
+                      <span className="font-mono">#{c.id}</span>
+                      <span className="truncate">{c.email || '(无邮箱)'}</span>
+                      <Badge variant="secondary" className="text-[10px] px-1.5">{c.group}</Badge>
+                      <Badge variant="destructive" className="text-[10px] px-1.5">
+                        {c.reason === 'too_many_failures' ? '连续失败' : '额度耗尽'}
+                      </Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {restockStatus?.logs && restockStatus.logs.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-xs font-medium">运行日志</div>
+                <div className="rounded border bg-muted/30 p-2 max-h-48 overflow-y-auto font-mono text-xs space-y-0.5">
+                  {restockStatus.logs.map((line: string, i: number) => (
                     <div key={i} className="text-muted-foreground">{line}</div>
                   ))}
                 </div>
