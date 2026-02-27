@@ -55,10 +55,10 @@ export default function RestockPlugin() {
   const [loadingInv, setLoadingInv] = useState(false)
   const [orders, setOrders] = useState<any[] | null>(null)
   const [loadingOrders, setLoadingOrders] = useState(false)
-  // 点击展开详情
-  const [expandedOrderId, setExpandedOrderId] = useState<number | null>(null)
-  const [detail, setDetail] = useState<any | null>(null)
-  const [loadingDetail, setLoadingDetail] = useState(false)
+  // 点击展开详情（支持多订单同时展开 + 缓存）
+  const [expandedOrders, setExpandedOrders] = useState<Set<number>>(new Set())
+  const [detailCache, setDetailCache] = useState<Map<number, any>>(new Map())
+  const [loadingDetailIds, setLoadingDetailIds] = useState<Set<number>>(new Set())
   const [importingDeliveryId, setImportingDeliveryId] = useState<number | null>(null)
   // 已有凭据的 refreshTokenHash 集合（用于判断账号是否已导入）
   const [credHashSet, setCredHashSet] = useState<Set<string>>(new Set())
@@ -146,27 +146,28 @@ export default function RestockPlugin() {
 
   // 点击订单行展开/收起详情
   const handleToggleOrder = async (orderId: number) => {
-    if (expandedOrderId === orderId) {
-      setExpandedOrderId(null)
-      setDetail(null)
-      setBanData(new Map())
-      setCollapsedDeliveries(new Set())
+    // 折叠
+    if (expandedOrders.has(orderId)) {
+      setExpandedOrders(prev => { const next = new Set(prev); next.delete(orderId); return next })
       return
     }
-    setExpandedOrderId(orderId)
-    setLoadingDetail(true)
-    setBanData(new Map())
-    setCollapsedDeliveries(new Set())
+    // 展开
+    setExpandedOrders(prev => new Set(prev).add(orderId))
+
+    // 已有缓存则跳过
+    if (detailCache.has(orderId)) return
+
+    setLoadingDetailIds(prev => new Set(prev).add(orderId))
     try {
       const [d, creds] = await Promise.all([
         getRestockOrderDetail(config.token, orderId),
         getCredentials().catch(() => null),
       ])
-      setDetail(d)
+      setDetailCache(prev => new Map(prev).set(orderId, d))
       if (creds) {
         setCredHashSet(new Set(creds.credentials.map(c => c.refreshTokenHash).filter(Boolean) as string[]))
       }
-      // 预计算所有 account 的 refresh_token hash
+      // 预计算 hash
       try {
         const allRts: string[] = []
         for (const del of d.deliveries || []) {
@@ -176,10 +177,14 @@ export default function RestockPlugin() {
           }
         }
         const hashEntries = await Promise.all(allRts.map(async rt => [rt, await sha256Hex(rt)] as const))
-        setAccountHashMap(new Map(hashEntries))
-      } catch { /* hash 计算失败不影响详情展示 */ }
+        setAccountHashMap(prev => {
+          const next = new Map(prev)
+          for (const [k, v] of hashEntries) next.set(k, v)
+          return next
+        })
+      } catch {}
 
-      // 过保的 delivery 默认收起
+      // 过保 delivery 默认收起
       const warrantyHours = (d as any).warranty_hours ?? orders?.find(o => o.id === orderId)?.warranty_hours ?? 0
       if (warrantyHours > 0 && d.deliveries) {
         const collapsed = new Set<number>()
@@ -187,10 +192,14 @@ export default function RestockPlugin() {
           const w = checkWarranty(del.delivered_at, warrantyHours)
           if (w.expired) collapsed.add(del.id)
         }
-        setCollapsedDeliveries(collapsed)
+        setCollapsedDeliveries(prev => {
+          const next = new Set(prev)
+          for (const id of collapsed) next.add(id)
+          return next
+        })
       }
 
-      // 自动执行封禁检测
+      // 封禁检测
       setLoadingBan(true)
       checkRestockBan(config.token, orderId)
         .then(res => {
@@ -198,14 +207,20 @@ export default function RestockPlugin() {
           for (const d of res.deliveries || []) {
             map.set(d.delivery_id, { banned_count: d.banned_count, results: d.results })
           }
-          setBanData(map)
+          setBanData(prev => {
+            const next = new Map(prev)
+            for (const [k, v] of map) next.set(k, v)
+            return next
+          })
         })
-        .catch(() => { /* 封禁检测失败不阻塞 */ })
+        .catch(() => {})
         .finally(() => setLoadingBan(false))
     } catch (e: any) {
       toast.error(e?.response?.data?.error || '订单详情查询失败')
-      setExpandedOrderId(null)
-    } finally { setLoadingDetail(false) }
+      setExpandedOrders(prev => { const next = new Set(prev); next.delete(orderId); return next })
+    } finally {
+      setLoadingDetailIds(prev => { const next = new Set(prev); next.delete(orderId); return next })
+    }
   }
 
   // 复制发货批次凭据
@@ -589,7 +604,7 @@ export default function RestockPlugin() {
                       className="flex items-center gap-2 py-2.5 px-4 cursor-pointer hover:bg-muted/50 transition-colors text-sm"
                       onClick={() => handleToggleOrder(o.id)}
                     >
-                      {expandedOrderId === o.id
+                      {expandedOrders.has(o.id)
                         ? <ChevronDown className="h-3.5 w-3.5 shrink-0" />
                         : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
                       <span className="font-medium">#{o.id}</span>
@@ -600,7 +615,10 @@ export default function RestockPlugin() {
                       </Badge>
                     </div>
                     {/* 展开的订单详情 */}
-                    {expandedOrderId === o.id && (
+                    {expandedOrders.has(o.id) && (() => {
+                      const detail = detailCache.get(o.id)
+                      const loadingDetail = loadingDetailIds.has(o.id)
+                      return (
                       <div className="px-4 pb-3 bg-muted/30">
                         {loadingDetail ? (
                           <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
@@ -713,7 +731,8 @@ export default function RestockPlugin() {
                           </div>
                         ) : null}
                       </div>
-                    )}
+                      )
+                    })()}
                   </div>
                 ))}
               </div>
