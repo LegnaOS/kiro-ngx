@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Package, ShoppingCart, FileText, ShieldAlert, Loader2, Search, Copy, Download, ChevronDown, ChevronRight, Play, Square, RefreshCw, RotateCcw, Plus, X, Power } from 'lucide-react'
+import { Package, ShoppingCart, FileText, Loader2, Search, Copy, Download, ChevronDown, ChevronRight, Play, Square, RefreshCw, RotateCcw, Power } from 'lucide-react'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -20,6 +20,17 @@ const STATUS_MAP: Record<string, string> = {
 }
 
 const DEFAULT_REGIONS = ['eu-north-1', 'us-east-1']
+
+function checkWarranty(deliveredAt: string, warrantyHours: number): { expired: boolean; msg: string } {
+  if (warrantyHours <= 0) return { expired: false, msg: '无质保' }
+  if (!deliveredAt) return { expired: false, msg: '无发货时间' }
+  const delivered = new Date(deliveredAt)
+  const expire = new Date(delivered.getTime() + warrantyHours * 3600_000)
+  const now = new Date()
+  if (now > expire) return { expired: true, msg: '已过保' }
+  const remainH = (expire.getTime() - now.getTime()) / 3600_000
+  return { expired: false, msg: `剩余 ${remainH.toFixed(1)}h` }
+}
 
 async function sha256Hex(text: string): Promise<string> {
   if (crypto.subtle) {
@@ -52,10 +63,11 @@ export default function RestockPlugin() {
   const [credHashSet, setCredHashSet] = useState<Set<string>>(new Set())
   // account refreshToken -> sha256 hash 映射（预计算）
   const [accountHashMap, setAccountHashMap] = useState<Map<string, string>>(new Map())
-  // 封禁检测
-  const [banId, setBanId] = useState('')
-  const [banResult, setBanResult] = useState<any | null>(null)
+  // 封禁检测（展开订单时自动执行）
+  const [banData, setBanData] = useState<Map<number, { banned_count: number; results: Array<{ email: string; banned: boolean }> }>>(new Map())
   const [loadingBan, setLoadingBan] = useState(false)
+  // 过保的 delivery 默认收起
+  const [collapsedDeliveries, setCollapsedDeliveries] = useState<Set<number>>(new Set())
   // 换号/提货操作中
   const [replacingDeliveryId, setReplacingDeliveryId] = useState<number | null>(null)
   const [deliveringOrderId, setDeliveringOrderId] = useState<number | null>(null)
@@ -73,9 +85,6 @@ export default function RestockPlugin() {
   const [restockLoading, setRestockLoading] = useState(false)
   const [restockInterval, setRestockInterval] = useState('30')
   const restockPollRef = useRef<ReturnType<typeof setInterval>>()
-  // Region 列表
-  const [regions, setRegions] = useState<string[]>([...DEFAULT_REGIONS])
-  const [newRegion, setNewRegion] = useState('')
 
   // 初始化从服务端加载配置
   useEffect(() => {
@@ -136,11 +145,14 @@ export default function RestockPlugin() {
     if (expandedOrderId === orderId) {
       setExpandedOrderId(null)
       setDetail(null)
+      setBanData(new Map())
+      setCollapsedDeliveries(new Set())
       return
     }
     setExpandedOrderId(orderId)
-    setBanId(String(orderId))
     setLoadingDetail(true)
+    setBanData(new Map())
+    setCollapsedDeliveries(new Set())
     try {
       const [d, creds] = await Promise.all([
         getRestockOrderDetail(config.token, orderId),
@@ -150,7 +162,7 @@ export default function RestockPlugin() {
       if (creds) {
         setCredHashSet(new Set(creds.credentials.map(c => c.refreshTokenHash).filter(Boolean) as string[]))
       }
-      // 预计算所有 account 的 refresh_token hash（用同级字段）
+      // 预计算所有 account 的 refresh_token hash
       try {
         const allRts: string[] = []
         for (const del of d.deliveries || []) {
@@ -162,6 +174,30 @@ export default function RestockPlugin() {
         const hashEntries = await Promise.all(allRts.map(async rt => [rt, await sha256Hex(rt)] as const))
         setAccountHashMap(new Map(hashEntries))
       } catch { /* hash 计算失败不影响详情展示 */ }
+
+      // 过保的 delivery 默认收起
+      const warrantyHours = (d as any).warranty_hours ?? orders?.find(o => o.id === orderId)?.warranty_hours ?? 0
+      if (warrantyHours > 0 && d.deliveries) {
+        const collapsed = new Set<number>()
+        for (const del of d.deliveries) {
+          const w = checkWarranty(del.delivered_at, warrantyHours)
+          if (w.expired) collapsed.add(del.id)
+        }
+        setCollapsedDeliveries(collapsed)
+      }
+
+      // 自动执行封禁检测
+      setLoadingBan(true)
+      checkRestockBan(config.token, orderId)
+        .then(res => {
+          const map = new Map<number, { banned_count: number; results: Array<{ email: string; banned: boolean }> }>()
+          for (const d of res.deliveries || []) {
+            map.set(d.delivery_id, { banned_count: d.banned_count, results: d.results })
+          }
+          setBanData(map)
+        })
+        .catch(() => { /* 封禁检测失败不阻塞 */ })
+        .finally(() => setLoadingBan(false))
     } catch (e: any) {
       toast.error(e?.response?.data?.error || '订单详情查询失败')
       setExpandedOrderId(null)
@@ -177,13 +213,20 @@ export default function RestockPlugin() {
     toast.success(`已复制 ${accounts.length} 条凭据`)
   }
 
-  // 导入发货批次凭据到系统（按 region 列表依次尝试）
+  // 导入发货批次凭据到系统（按 region 列表依次尝试，跳过已封号账号）
   const handleImportDelivery = async (deliveryId: number, accountData: any[]) => {
     setImportingDeliveryId(deliveryId)
-    let success = 0, skipped = 0
+    let success = 0, skipped = 0, bannedSkipped = 0
     const errors: string[] = []
+    // 获取该批次的封禁数据
+    const deliveryBan = banData.get(deliveryId)
+    const bannedEmails = new Set(
+      deliveryBan?.results?.filter(r => r.banned).map(r => r.email) ?? []
+    )
     for (const item of accountData) {
       const email = item.email || '(未知)'
+      // 跳过已封号账号
+      if (bannedEmails.has(email)) { bannedSkipped++; continue }
       try {
         const jsonArr = JSON.parse(item.account_json)
         const cred = Array.isArray(jsonArr) ? jsonArr[0] : jsonArr
@@ -199,7 +242,16 @@ export default function RestockPlugin() {
         const base = { refreshToken, authMethod, clientId, clientSecret }
         let ok = false
         let lastErr = ''
-        for (const region of regions) {
+        const importRegions = (() => {
+          try { const s = localStorage.getItem('kiro-import-regions'); if (s) return JSON.parse(s) as string[] } catch {}
+          return DEFAULT_REGIONS
+        })()
+        // 指定的区域优先，失败后继续尝试列表中其余区域
+        const specifiedRegion = (item.region || cred.region || '').trim()
+        const regionsToTry = specifiedRegion
+          ? [specifiedRegion, ...importRegions.filter((r: string) => r !== specifiedRegion)]
+          : importRegions
+        for (const region of regionsToTry) {
           try {
             await addCredential({ ...base, authRegion: region })
             ok = true
@@ -215,6 +267,7 @@ export default function RestockPlugin() {
     const parts: string[] = []
     if (success) parts.push(`成功 ${success}`)
     if (skipped) parts.push(`跳过已存在 ${skipped}`)
+    if (bannedSkipped) parts.push(`跳过封号 ${bannedSkipped}`)
     if (errors.length) parts.push(`失败 ${errors.length}`)
     if (errors.length === 0) {
       toast.success(`导入完成: ${parts.join(', ')}`)
@@ -223,15 +276,6 @@ export default function RestockPlugin() {
       for (const err of errors.slice(0, 5)) toast.error(err)
       if (errors.length > 5) toast.error(`...还有 ${errors.length - 5} 条失败`)
     }
-  }
-
-  const fetchBan = async () => {
-    const id = banId.trim()
-    if (!requireToken() || !id) return
-    setLoadingBan(true)
-    try { setBanResult(await checkRestockBan(config.token, Number(id))) }
-    catch (e: any) { toast.error(e?.response?.data?.error || '封禁检测失败') }
-    finally { setLoadingBan(false) }
   }
 
   // 一键换号
@@ -370,46 +414,6 @@ export default function RestockPlugin() {
         </CardContent>
       </Card>
 
-      {/* Region 列表 */}
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            Region 列表
-            <span className="text-xs text-muted-foreground font-normal">导入凭据时按顺序尝试</span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-wrap items-center gap-2">
-            {regions.map(r => (
-              <div key={r} className="flex items-center gap-1 rounded border px-2 py-1 text-xs">
-                <span className="font-mono">{r}</span>
-                {!DEFAULT_REGIONS.includes(r) && (
-                  <button className="text-muted-foreground hover:text-destructive ml-1"
-                    onClick={() => setRegions(prev => prev.filter(x => x !== r))}>
-                    <X className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
-            ))}
-            <div className="flex items-center gap-1">
-              <Input type="text" placeholder="新 region" className="w-32 h-7 text-xs"
-                value={newRegion} onChange={e => setNewRegion(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter' && newRegion.trim() && !regions.includes(newRegion.trim())) {
-                    setRegions(prev => [...prev, newRegion.trim()])
-                    setNewRegion('')
-                  }
-                }} />
-              <Button size="sm" variant="outline" className="h-7 text-xs"
-                disabled={!newRegion.trim() || regions.includes(newRegion.trim())}
-                onClick={() => { setRegions(prev => [...prev, newRegion.trim()]); setNewRegion('') }}>
-                <Plus className="h-3 w-3" />
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
       {/* 功能区 */}
       <div className="grid gap-6 md:grid-cols-2">
         {/* 库存查询 */}
@@ -501,49 +505,84 @@ export default function RestockPlugin() {
                             {detail.deliveries?.length > 0 ? (
                               detail.deliveries.slice().reverse().map((d: any, di: number) => {
                                 const accounts: any[] = d.account_data || []
+                                const warrantyHours = (detail as any).warranty_hours ?? orders?.find(ord => ord.id === o.id)?.warranty_hours ?? 0
+                                const warranty = checkWarranty(d.delivered_at, warrantyHours)
+                                const isCollapsed = collapsedDeliveries.has(d.id)
+                                const deliveryBan = banData.get(d.id)
                                 return (
                                   <div key={di} className="rounded border bg-background p-2.5 space-y-1.5">
-                                    <div className="flex items-center justify-between flex-wrap gap-1">
-                                      <span className="text-xs font-medium">
+                                    <div
+                                      className="flex items-center justify-between flex-wrap gap-1 cursor-pointer"
+                                      onClick={e => {
+                                        e.stopPropagation()
+                                        setCollapsedDeliveries(prev => {
+                                          const next = new Set(prev)
+                                          if (next.has(d.id)) next.delete(d.id); else next.add(d.id)
+                                          return next
+                                        })
+                                      }}
+                                    >
+                                      <span className="text-xs font-medium flex items-center gap-1.5">
+                                        {isCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
                                         发货批次 {di + 1} — 账号数: {accounts.length}
-                                        <span className="text-muted-foreground ml-2">{d.delivered_at}</span>
+                                        <span className="text-muted-foreground">{d.delivered_at}</span>
+                                        <Badge variant={warranty.expired ? 'destructive' : 'secondary'} className="text-[10px] px-1.5">
+                                          {warranty.msg}
+                                        </Badge>
+                                        {deliveryBan && deliveryBan.banned_count > 0 && (
+                                          <Badge variant="destructive" className="text-[10px] px-1.5">封禁 {deliveryBan.banned_count}</Badge>
+                                        )}
+                                        {deliveryBan && deliveryBan.banned_count === 0 && (
+                                          <Badge variant="success" className="text-[10px] px-1.5">全部正常</Badge>
+                                        )}
+                                        {!deliveryBan && loadingBan && (
+                                          <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                                        )}
                                       </span>
-                                      <div className="flex gap-1.5 flex-wrap">
-                                        <Button size="sm" variant="outline" className="h-7 text-xs"
-                                          disabled={replacingDeliveryId === d.id}
-                                          onClick={e => { e.stopPropagation(); handleBatchReplace(o.id, d.id) }}>
-                                          <RotateCcw className="h-3 w-3 mr-1" />
-                                          {replacingDeliveryId === d.id ? '换号中...' : '换号'}
-                                        </Button>
-                                        <Button size="sm" variant="outline" className="h-7 text-xs"
-                                          onClick={e => { e.stopPropagation(); handleCopyDelivery(accounts) }}>
-                                          <Copy className="h-3 w-3 mr-1" /> 复制
-                                        </Button>
-                                        <Button size="sm" variant="outline" className="h-7 text-xs"
-                                          disabled={importingDeliveryId === d.id}
-                                          onClick={e => { e.stopPropagation(); handleImportDelivery(d.id, accounts) }}>
-                                          <Download className="h-3 w-3 mr-1" />
-                                          {importingDeliveryId === d.id ? '导入中...' : '导入凭据'}
-                                        </Button>
+                                      {!isCollapsed && (
+                                        <div className="flex gap-1.5 flex-wrap" onClick={e => e.stopPropagation()}>
+                                          <Button size="sm" variant="outline" className="h-7 text-xs"
+                                            disabled={replacingDeliveryId === d.id}
+                                            onClick={e => { e.stopPropagation(); handleBatchReplace(o.id, d.id) }}>
+                                            <RotateCcw className="h-3 w-3 mr-1" />
+                                            {replacingDeliveryId === d.id ? '换号中...' : '换号'}
+                                          </Button>
+                                          <Button size="sm" variant="outline" className="h-7 text-xs"
+                                            onClick={e => { e.stopPropagation(); handleCopyDelivery(accounts) }}>
+                                            <Copy className="h-3 w-3 mr-1" /> 复制
+                                          </Button>
+                                          <Button size="sm" variant="outline" className="h-7 text-xs"
+                                            disabled={importingDeliveryId === d.id}
+                                            onClick={e => { e.stopPropagation(); handleImportDelivery(d.id, accounts) }}>
+                                            <Download className="h-3 w-3 mr-1" />
+                                            {importingDeliveryId === d.id ? '导入中...' : '导入凭据'}
+                                          </Button>
+                                        </div>
+                                      )}
+                                    </div>
+                                    {/* 账号列表（收起时隐藏） */}
+                                    {!isCollapsed && (
+                                      <div className="space-y-0.5 pt-1">
+                                        {accounts.map((a: any, ai: number) => {
+                                          const email = a.email || ''
+                                          const rt = a.refresh_token || ''
+                                          const hash = accountHashMap.get(rt)
+                                          const exists = hash ? credHashSet.has(hash) : false
+                                          const banInfo = deliveryBan?.results?.find(r => r.email === email)
+                                          return (
+                                            <div key={ai} className="flex items-center gap-2 text-xs py-0.5 px-1 rounded hover:bg-muted/50">
+                                              <Badge variant={exists ? 'success' : 'secondary'} className="text-[10px] px-1.5 shrink-0">
+                                                {exists ? '已导入' : '未导入'}
+                                              </Badge>
+                                              {banInfo !== undefined && (
+                                                <span className="shrink-0">{banInfo.banned ? '🔴' : '🟢'}</span>
+                                              )}
+                                              <span className="font-mono truncate">{email || '(无邮箱)'}</span>
+                                            </div>
+                                          )
+                                        })}
                                       </div>
-                                    </div>
-                                    {/* 账号列表 */}
-                                    <div className="space-y-0.5 pt-1">
-                                      {accounts.map((a: any, ai: number) => {
-                                        const email = a.email || ''
-                                        const rt = a.refresh_token || ''
-                                        const hash = accountHashMap.get(rt)
-                                        const exists = hash ? credHashSet.has(hash) : false
-                                        return (
-                                          <div key={ai} className="flex items-center gap-2 text-xs py-0.5 px-1 rounded hover:bg-muted/50">
-                                            <Badge variant={exists ? 'success' : 'secondary'} className="text-[10px] px-1.5 shrink-0">
-                                              {exists ? '已导入' : '未导入'}
-                                            </Badge>
-                                            <span className="font-mono truncate">{email || '(无邮箱)'}</span>
-                                          </div>
-                                        )
-                                      })}
-                                    </div>
+                                    )}
                                   </div>
                                 )
                               })
@@ -566,49 +605,6 @@ export default function RestockPlugin() {
                         ) : null}
                       </div>
                     )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* 封禁检测 */}
-        <Card className="md:col-span-2">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <ShieldAlert className="h-4 w-4" /> 封禁检测
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="flex items-center gap-2">
-              <Input type="text" autoComplete="off" placeholder="订单 ID（点击订单自动填充）" value={banId}
-                onChange={e => setBanId(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && fetchBan()} className="w-64" />
-              <Button size="sm" onClick={fetchBan} disabled={loadingBan || !banId.trim()}>
-                {loadingBan ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldAlert className="h-4 w-4 mr-1" />}
-                检测
-              </Button>
-            </div>
-            {banResult && (
-              <div className="text-sm space-y-2 max-h-64 overflow-y-auto">
-                {banResult.message && <p className="text-muted-foreground">{banResult.message}</p>}
-                {banResult.deliveries?.map((d: any, di: number) => (
-                  <div key={di} className="space-y-1">
-                    <div className="flex items-center gap-2 text-xs">
-                      <span>批次 #{d.delivery_id}</span>
-                      <Badge variant="secondary">共 {d.total}</Badge>
-                      {d.banned_count > 0 && <Badge variant="destructive">封禁 {d.banned_count}</Badge>}
-                      {d.banned_count === 0 && <Badge variant="success">全部正常</Badge>}
-                    </div>
-                    {d.results?.map((r: any, ri: number) => (
-                      <div key={ri} className="flex items-center gap-2 text-xs py-0.5 px-2 rounded hover:bg-muted/50">
-                        <Badge variant={r.banned ? 'destructive' : 'success'} className="text-[10px] px-1.5">
-                          {r.banned ? '封禁' : '正常'}
-                        </Badge>
-                        <span className="font-mono">{r.email}</span>
-                      </div>
-                    ))}
                   </div>
                 ))}
               </div>

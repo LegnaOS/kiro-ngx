@@ -65,6 +65,7 @@ export async function getRestockOrders(token: string) {
     orders: Array<{
       id: number; order_no: string; product_id: number
       quantity: number; total_price: number; status: string; created_at: string
+      warranty_hours?: number
     }>
     total: number
   }>('/plugins/restock/orders', { headers: restockHeaders(token) })
@@ -77,6 +78,7 @@ export async function getRestockOrderDetail(token: string, orderId: number) {
     order_no: string; product_id: number; product_name: string
     quantity: number; total_price: number; status: string
     quota_type: string; created_at: string; paid_at: string
+    warranty_hours?: number
     deliveries: Array<{
       id: number; delivered_at: string
       account_count: number

@@ -20,7 +20,6 @@ interface BatchVerifyDialogProps {
   verifying: boolean
   progress: { current: number; total: number }
   results: Map<number, VerifyResult>
-  onCancel: () => void
 }
 
 export function BatchVerifyDialog({
@@ -29,7 +28,6 @@ export function BatchVerifyDialog({
   verifying,
   progress,
   results,
-  onCancel,
 }: BatchVerifyDialogProps) {
   const resultsArray = Array.from(results.values())
   const successCount = resultsArray.filter(r => r.status === 'success').length
@@ -120,31 +118,13 @@ export function BatchVerifyDialog({
         </div>
 
         <div className="flex justify-end gap-2">
-          {verifying ? (
-            <>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => onOpenChange(false)}
-              >
-                后台运行
-              </Button>
-              <Button
-                type="button"
-                variant="destructive"
-                onClick={onCancel}
-              >
-                取消验活
-              </Button>
-            </>
-          ) : (
-            <Button
-              type="button"
-              onClick={() => onOpenChange(false)}
-            >
-              关闭
-            </Button>
-          )}
+          <Button
+            type="button"
+            variant={verifying ? 'outline' : 'default'}
+            onClick={() => onOpenChange(false)}
+          >
+            {verifying ? '后台运行' : '关闭'}
+          </Button>
         </div>
       </DialogContent>
     </Dialog>

@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Plus, X } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -9,6 +9,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -56,17 +57,29 @@ async function sha256Hex(value: string): Promise<string> {
   return (h >>> 0).toString(16).padStart(8, '0') + value.length.toString(16).padStart(8, '0')
 }
 
+const REGIONS_STORAGE_KEY = 'kiro-import-regions'
+const DEFAULT_REGIONS = ['eu-north-1', 'us-east-1']
+function loadRegions(): string[] {
+  try { const s = localStorage.getItem(REGIONS_STORAGE_KEY); if (s) return JSON.parse(s) } catch {}
+  return [...DEFAULT_REGIONS]
+}
+
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
-  const [skipVerify, setSkipVerify] = useState(false)
+  const [skipVerify, setSkipVerify] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [regions, setRegions] = useState<string[]>(loadRegions)
+  const [newRegion, setNewRegion] = useState('')
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+
+  // 持久化 region 列表
+  useEffect(() => { localStorage.setItem(REGIONS_STORAGE_KEY, JSON.stringify(regions)) }, [regions])
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -183,16 +196,27 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
-          const addedCred = await addCredential({
-            refreshToken: token,
-            authMethod,
-            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
-            clientId,
-            clientSecret,
-            priority: cred.priority || 0,
-            machineId: cred.machineId?.trim() || undefined,
-          })
+          const addedCred = await (async () => {
+            const specifiedRegion = cred.authRegion?.trim() || cred.region?.trim()
+            // 指定的区域优先，但失败后继续尝试列表中其余区域
+            const regionsToTry = specifiedRegion
+              ? [specifiedRegion, ...regions.filter(r => r !== specifiedRegion)]
+              : regions
+            let lastErr: any = null
+            for (const region of regionsToTry) {
+              try {
+                return await addCredential({
+                  refreshToken: token, authMethod,
+                  authRegion: region,
+                  apiRegion: cred.apiRegion?.trim() || undefined,
+                  clientId, clientSecret,
+                  priority: cred.priority || 0,
+                  machineId: cred.machineId?.trim() || undefined,
+                })
+              } catch (e) { lastErr = e }
+            }
+            throw lastErr || new Error('所有区域均失败')
+          })()
 
           addedCredId = addedCred.credentialId
 
@@ -343,20 +367,52 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          {/* Region 列表 */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">
+              Region 列表 <span className="text-xs text-muted-foreground font-normal">导入失败时按顺序尝试其余区域</span>
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              {regions.map(r => (
+                <div key={r} className="flex items-center gap-1 rounded border px-2 py-1 text-xs">
+                  <span className="font-mono">{r}</span>
+                  {!DEFAULT_REGIONS.includes(r) && (
+                    <button className="text-muted-foreground hover:text-destructive ml-1"
+                      onClick={() => setRegions(prev => prev.filter(x => x !== r))}>
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="flex items-center gap-1">
+                <Input type="text" placeholder="新 region" className="w-32 h-7 text-xs"
+                  value={newRegion} onChange={e => setNewRegion(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && newRegion.trim() && !regions.includes(newRegion.trim())) {
+                      setRegions(prev => [...prev, newRegion.trim()])
+                      setNewRegion('')
+                    }
+                  }} />
+                <Button size="sm" variant="outline" className="h-7 text-xs"
+                  disabled={!newRegion.trim() || regions.includes(newRegion.trim())}
+                  onClick={() => { setRegions(prev => [...prev, newRegion.trim()]); setNewRegion('') }}>
+                  <Plus className="h-3 w-3" />
+                </Button>
+              </div>
+            </div>
+          </div>
+
           <div className="space-y-2">
             <label className="text-sm font-medium">
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1"}]\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
-            <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
-            </p>
             <label className="flex items-center gap-2 text-sm cursor-pointer">
               <input
                 type="checkbox"

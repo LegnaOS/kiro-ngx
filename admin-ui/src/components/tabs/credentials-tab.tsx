@@ -329,8 +329,7 @@ export function CredentialsTab() {
       <BatchImportDialog open={batchImportDialogOpen} onOpenChange={setBatchImportDialogOpen} />
       <CredentialsEditorDialog open={credentialsEditorOpen} onOpenChange={setCredentialsEditorOpen} />
       <BatchVerifyDialog open={verifyDialogOpen} onOpenChange={setVerifyDialogOpen}
-        verifying={verifying} progress={verifyProgress} results={verifyResults}
-        onCancel={() => { cancelVerifyRef.current = true; setVerifying(false) }} />
+        verifying={verifying} progress={verifyProgress} results={verifyResults} />
     </div>
   )
 }
