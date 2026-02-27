@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Package, ShoppingCart, FileText, Loader2, Search, Copy, Download, ChevronDown, ChevronRight, Play, Square, RefreshCw, RotateCcw, Power } from 'lucide-react'
+import { Package, ShoppingCart, FileText, Loader2, Search, Copy, Download, ChevronDown, ChevronRight, Play, Square, RefreshCw, RotateCcw, Power, Shield } from 'lucide-react'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -13,6 +13,7 @@ import {
   restockDeliver, restockBatchReplace, analyzeRestockOrders,
   startAutoReplace, stopAutoReplace, getAutoReplaceStatus,
   startAutoRestock, stopAutoRestock, getAutoRestockStatus,
+  refreshWarrantyList,
 } from '@/api/plugins'
 
 const STATUS_MAP: Record<string, string> = {
@@ -85,6 +86,7 @@ export default function RestockPlugin() {
   const [restockLoading, setRestockLoading] = useState(false)
   const [restockInterval, setRestockInterval] = useState('30')
   const restockPollRef = useRef<ReturnType<typeof setInterval>>()
+  const [warrantyRefreshing, setWarrantyRefreshing] = useState(false)
 
   // 初始化从服务端加载配置
   useEffect(() => {
@@ -369,6 +371,16 @@ export default function RestockPlugin() {
       pollRestockStatus()
     } catch (e: any) { toast.error(e?.response?.data?.error || '停止失败') }
     finally { setRestockLoading(false) }
+  }
+
+  const handleRefreshWarranty = async () => {
+    setWarrantyRefreshing(true)
+    try {
+      const res = await refreshWarrantyList()
+      toast.success(`在保名单已刷新，共 ${res.warranty_count} 个账号`)
+      pollRestockStatus()
+    } catch (e: any) { toast.error(e?.response?.data?.error || '刷新失败') }
+    finally { setWarrantyRefreshing(false) }
   }
 
   useEffect(() => {
@@ -750,6 +762,23 @@ export default function RestockPlugin() {
               {restockStatus?.disabled_creds && restockStatus.disabled_creds.length > 0 && (
                 <span className="text-muted-foreground">异常禁用: {restockStatus.disabled_creds.length} 个</span>
               )}
+            </div>
+
+            {/* 在保账号 */}
+            <div className="rounded border bg-background p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-sm">
+                  <Shield className="h-4 w-4 text-muted-foreground" />
+                  <span className="font-medium">在保账号</span>
+                  <Badge variant="secondary">{restockStatus?.warranty_count ?? 0} 个</Badge>
+                </div>
+                <Button size="sm" variant="outline" className="h-7 text-xs"
+                  onClick={handleRefreshWarranty} disabled={warrantyRefreshing}>
+                  {warrantyRefreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Search className="h-3.5 w-3.5 mr-1" />}
+                  {warrantyRefreshing ? '检查中...' : '检查所有订单'}
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">仅在保名单内的 client_id 失效时触发补货，每 30 分钟自动刷新</p>
             </div>
 
             {restockStatus?.disabled_creds && restockStatus.disabled_creds.length > 0 && (

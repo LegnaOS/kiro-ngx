@@ -167,7 +167,12 @@ export async function getAutoRestockStatus() {
   const { data } = await api.get<{
     running: boolean
     disabled_creds: Array<{ id: number; email: string | null; group: string; reason: string }>
-    interval: number; logs: string[]
+    interval: number; warranty_count: number; logs: string[]
   }>('/plugins/restock/auto-restock/status')
+  return data
+}
+
+export async function refreshWarrantyList() {
+  const { data } = await api.post<{ warranty_count: number }>('/plugins/restock/auto-restock/refresh-warranty')
   return data
 }

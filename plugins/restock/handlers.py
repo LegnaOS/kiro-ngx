@@ -1,6 +1,7 @@
 """Kiroshop 补货代理 handlers — 转发请求到 kiroshop.xyz"""
 
 import math
+import time
 import asyncio
 import logging
 from pathlib import Path
@@ -33,6 +34,44 @@ def _kiroshop_headers(token: str, referer: str = "https://kiroshop.xyz/shop") ->
 
 def _extract_token(request: Request) -> str | None:
     return request.headers.get("x-kiroshop-token")
+
+
+def _kiroshop_login_sync(email: str, password: str) -> str:
+    """同步登录 kiroshop，返回新 token；失败抛异常"""
+    headers = {
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Origin": "https://kiroshop.xyz",
+        "Referer": "https://kiroshop.xyz/shop",
+        "User-Agent": _UA,
+    }
+    data = json.dumps({"email": email, "password": password}).encode("utf-8")
+    req = UrlRequest("https://kiroshop.xyz/shop/api/auth/login",
+                     data=data, headers=headers, method="POST")
+    with urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    token = result.get("token", "")
+    if not token:
+        raise RuntimeError("登录失败，未返回 token")
+    return token
+
+
+def _relogin_and_save() -> str:
+    """从配置读取账密重新登录，更新 config 中的 token 并返回"""
+    cfg = {}
+    if _CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(_CONFIG_PATH.read_text("utf-8"))
+        except Exception:
+            pass
+    email = cfg.get("email", "").strip()
+    password = cfg.get("password", "").strip()
+    if not email or not password:
+        raise RuntimeError("配置中缺少 email 或 password，无法重新登录")
+    token = _kiroshop_login_sync(email, password)
+    cfg["token"] = token
+    _CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
+    return token
 
 
 def _kiroshop_get(url: str, token: str, referer: str = "https://kiroshop.xyz/shop") -> dict | list:
@@ -650,6 +689,8 @@ _auto_restock_state: dict = {
     "interval": 30,
     "disabled_creds": [],
     "logs": [],
+    "warranty_client_ids": set(),
+    "last_warranty_refresh": 0.0,
 }
 
 
@@ -660,6 +701,45 @@ def _restock_log(msg: str):
     if len(_auto_restock_state["logs"]) > _MAX_LOGS:
         _auto_restock_state["logs"] = _auto_restock_state["logs"][-_MAX_LOGS:]
     logger.info(f"[auto-restock] {msg}")
+
+
+def _refresh_warranty_list(token: str) -> set[str]:
+    """拉取所有 paid 订单，收集在保 delivery 中的 client_id"""
+    all_orders = []
+    page, page_size, total_pages = 1, 20, 1
+    while page <= total_pages:
+        result = _kiroshop_get(
+            f"{KIROSHOP_BASE}/orders?page={page}&page_size={page_size}",
+            token, "https://kiroshop.xyz/shop/orders",
+        )
+        all_orders.extend(result.get("items", []))
+        if page == 1:
+            t = result.get("total", 0)
+            total_pages = math.ceil(t / page_size) if t > 0 else 1
+        page += 1
+
+    paid = [o for o in all_orders if o.get("status") == "paid"]
+    client_ids: set[str] = set()
+    for order in paid:
+        oid = order["id"]
+        wh = order.get("warranty_hours", 0)
+        try:
+            detail = _kiroshop_get(
+                f"{KIROSHOP_BASE}/orders/{oid}",
+                token, "https://kiroshop.xyz/shop/orders",
+            )
+        except Exception:
+            continue
+        for d in detail.get("deliveries", []):
+            delivered_at = d.get("delivered_at", "")
+            is_expired, _ = _check_warranty(delivered_at, wh)
+            if is_expired:
+                continue
+            for acc in d.get("account_data", []):
+                cid = acc.get("client_id", "")
+                if cid:
+                    client_ids.add(cid)
+    return client_ids
 
 
 def _get_abnormal_disabled_creds(app) -> list[dict]:
@@ -677,12 +757,13 @@ def _get_abnormal_disabled_creds(app) -> list[dict]:
         result.append({
             "id": c.id, "email": c.email,
             "group": c.group, "reason": c.disabled_reason,
+            "client_id": c.client_id,
         })
     return result
 
 
 async def _auto_restock_loop():
-    """持续监控异常禁用凭据，发现后触发补货流程"""
+    """持续监控异常禁用凭据，仅在保名单内的 client_id 触发补货"""
     state = _auto_restock_state
     app = state["app"]
 
@@ -691,6 +772,18 @@ async def _auto_restock_loop():
     try:
         while state["running"]:
             interval = state["interval"]
+
+            # 刷新在保名单（首次 or 距上次 >= 30 分钟）
+            now_ts = time.time()
+            if now_ts - state["last_warranty_refresh"] >= 1800:
+                try:
+                    w_token = _relogin_and_save()
+                    ids = _refresh_warranty_list(w_token)
+                    state["warranty_client_ids"] = ids
+                    state["last_warranty_refresh"] = time.time()
+                    _restock_log(f"在保名单已刷新，共 {len(ids)} 个 client_id")
+                except Exception as e:
+                    _restock_log(f"刷新在保名单失败: {e}")
 
             try:
                 abnormal = _get_abnormal_disabled_creds(app)
@@ -705,8 +798,16 @@ async def _auto_restock_loop():
                 await asyncio.sleep(interval)
                 continue
 
-            emails = ", ".join(c["email"] or f"#{c['id']}" for c in abnormal)
-            _restock_log(f"检测到 {len(abnormal)} 个异常禁用凭据: {emails}")
+            # 筛选在保名单内的凭据
+            warranty_ids = state["warranty_client_ids"]
+            warranted = [c for c in abnormal if c.get("client_id") and c["client_id"] in warranty_ids]
+
+            if not warranted:
+                await asyncio.sleep(interval)
+                continue
+
+            emails = ", ".join(c["email"] or f"#{c['id']}" for c in warranted)
+            _restock_log(f"检测到 {len(warranted)} 个在保异常凭据: {emails}")
 
             # 补货流程已在运行则跳过
             if _auto_replace_state["running"]:
@@ -767,6 +868,8 @@ async def start_auto_restock(request: Request) -> JSONResponse:
     state["running"] = True
     state["logs"] = []
     state["disabled_creds"] = []
+    state["warranty_client_ids"] = set()
+    state["last_warranty_refresh"] = 0.0
     state["task"] = asyncio.create_task(_auto_restock_loop())
     return JSONResponse(content={"success": True})
 
@@ -790,5 +893,23 @@ async def get_auto_restock_status(request: Request) -> JSONResponse:
         "running": state["running"],
         "disabled_creds": state["disabled_creds"],
         "interval": state["interval"],
+        "warranty_count": len(state["warranty_client_ids"]),
         "logs": state["logs"][-100:],
     })
+
+
+async def refresh_warranty(request: Request) -> JSONResponse:
+    """手动刷新在保名单（先重新登录获取新 token）"""
+    try:
+        token = _relogin_and_save()
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    try:
+        ids = _refresh_warranty_list(token)
+        state = _auto_restock_state
+        state["warranty_client_ids"] = ids
+        state["last_warranty_refresh"] = time.time()
+        _restock_log(f"手动刷新在保名单，共 {len(ids)} 个 client_id")
+        return JSONResponse(content={"warranty_count": len(ids)})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
