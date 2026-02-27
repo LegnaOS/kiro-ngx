@@ -146,7 +146,7 @@ export async function getAutoReplaceStatus() {
   const { data } = await api.get<{
     running: boolean
     pending_tasks: Array<{ order_id: number; delivery_id: number; banned_count: number; warranty_msg: string }>
-    stock: number; interval: number
+    interval: number
     last_check: string; logs: string[]
   }>('/plugins/restock/auto-replace/status')
   return data

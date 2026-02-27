@@ -93,7 +93,11 @@ export function CredentialCard({
               <Checkbox checked={selected} onCheckedChange={onToggleSelect} />
               <span className="font-medium truncate">{credential.email || `#${credential.id}`}</span>
               {credential.isCurrent && <Badge variant="success">当前</Badge>}
-              {credential.disabled && <Badge variant="destructive">禁用</Badge>}
+              {credential.disabled && (
+                <Badge variant="destructive">
+                  {credential.disabledReason === 'too_many_failures' || credential.disabledReason === 'quota_exceeded' ? '封禁' : '禁用'}
+                </Badge>
+              )}
             </div>
             <Switch checked={!credential.disabled} onCheckedChange={handleToggleDisabled} disabled={setDisabled.isPending} />
           </div>

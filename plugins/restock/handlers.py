@@ -9,6 +9,7 @@ from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
 import json
 from datetime import datetime, timedelta
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import Request
@@ -452,13 +453,14 @@ async def analyze_restock_orders(request: Request) -> JSONResponse:
 
 
 # --- 自动补号后台任务 ---
-# 流程：启动时 analyze 获取待补号列表 → 循环检测库存(默认1秒) → 有货立即 batch-replace
+# 流程：启动时 analyze 获取待补号列表 → 按间隔直接调用 batch-replace → 成功后导入凭据
 
 _auto_replace_state: dict = {
     "running": False,
     "task": None,
+    "app": None,
     "pending_tasks": [],   # [{order_id, delivery_id, banned_count, warranty_msg}]
-    "stock": 0,
+    "replaced_deliveries": [],  # 成功补号的 (order_id, delivery_id) 列表，用于后续导入
     "last_check": "",
     "interval": 1,
     "logs": [],
@@ -491,7 +493,7 @@ def _try_replace_sync(order_id, delivery_id, token):
 
 
 def _analyze_sync(token: str) -> list[dict]:
-    """同步版 analyze：check-ban 每个 delivery，封号+在保=待补号"""
+    """同步版 analyze：paid+completed 订单，check-ban 每个未过保 delivery"""
     all_orders = []
     page, page_size, total_pages = 1, 20, 1
     while page <= total_pages:
@@ -505,9 +507,9 @@ def _analyze_sync(token: str) -> list[dict]:
             total_pages = math.ceil(t / page_size) if t > 0 else 1
         page += 1
 
-    paid = [o for o in all_orders if o.get("status") == "paid"]
+    active = [o for o in all_orders if o.get("status") in ("paid", "completed")]
     tasks = []
-    for order in paid:
+    for order in active:
         oid = order["id"]
         wh = order.get("warranty_hours", 0)
         try:
@@ -523,7 +525,6 @@ def _analyze_sync(token: str) -> list[dict]:
             is_expired, warranty_msg = _check_warranty(delivered_at, wh)
             if is_expired:
                 continue
-            # 在保 → 检测封号
             ban = _check_ban_sync(oid, did, token)
             if ban.get("banned_count", 0) > 0:
                 tasks.append({
@@ -535,7 +536,7 @@ def _analyze_sync(token: str) -> list[dict]:
 
 
 async def _auto_replace_loop():
-    """后台循环：只检测库存，有货立即对待补号列表执行 batch-replace"""
+    """后台循环：按间隔直接调用 batch-replace，成功/无封禁则移除；成功后提取凭据导入"""
     state = _auto_replace_state
 
     def _read_config():
@@ -543,14 +544,15 @@ async def _auto_replace_loop():
             return json.loads(_CONFIG_PATH.read_text("utf-8"))
         return {}
 
-    cfg = _read_config()
-    token = cfg.get("token", "")
-    if not token:
-        _ar_log("无 token，无法启动")
+    # 登录获取新 token
+    try:
+        token = _relogin_and_save()
+    except Exception as e:
+        _ar_log(f"登录失败: {e}")
         state["running"] = False
         return
 
-    # 1. 先 analyze 获取待补号列表
+    # 1. analyze 获取待补号列表
     _ar_log("正在分析订单封号状态...")
     try:
         tasks = _analyze_sync(token)
@@ -569,33 +571,20 @@ async def _auto_replace_loop():
     for t in tasks:
         _ar_log(f"  订单{t['order_id']}/发货{t['delivery_id']} 封禁{t['banned_count']}个 {t['warranty_msg']}")
 
-    # 2. 持续检测库存
+    # 2. 按间隔持续调用 batch-replace
+    state["replaced_deliveries"] = []
     try:
         while state["running"] and state["pending_tasks"]:
             cfg = _read_config()
             token = cfg.get("token", "")
             interval = state["interval"]
-
-            try:
-                products = _kiroshop_get(f"{KIROSHOP_BASE}/products", token)
-                stock = sum(p.get("stock", 0) for p in products)
-            except Exception as e:
-                _ar_log(f"获取库存失败: {e}")
-                await asyncio.sleep(interval)
-                continue
-
-            state["stock"] = stock
             state["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            if stock == 0:
-                await asyncio.sleep(interval)
-                continue
-
-            # 有库存，立即并行换号
             pending = list(state["pending_tasks"])
-            _ar_log(f"库存 {stock}，执行 {len(pending)} 个换号")
+            _ar_log(f"执行 {len(pending)} 个换号")
             loop = asyncio.get_event_loop()
             succeeded = set()
+            no_ban = set()
             with ThreadPoolExecutor(max_workers=min(len(pending), 10)) as pool:
                 futs = {
                     loop.run_in_executor(pool, _try_replace_sync, t["order_id"], t["delivery_id"], token): t
@@ -607,18 +596,30 @@ async def _auto_replace_loop():
                         replaced = detail.get("replaced_count", "?") if isinstance(detail, dict) else "?"
                         _ar_log(f"订单{oid}/发货{did}: 替换 {replaced} 个")
                         succeeded.add((oid, did))
+                    elif "No banned" in str(detail) or "no banned" in str(detail).lower():
+                        _ar_log(f"订单{oid}/发货{did}: 无封禁账号，移除")
+                        no_ban.add((oid, did))
                     elif "库存不足" in str(detail):
-                        _ar_log(f"订单{oid}/发货{did}: 库存不足")
+                        need = 0
+                        m = re.search(r"需要(\d+)个", str(detail))
+                        if m:
+                            need = int(m.group(1))
+                        _ar_log(f"订单{oid}/发货{did}: 库存不足{f' (需{need}个)' if need else ''}")
                     elif "质保期" in str(detail):
                         _ar_log(f"订单{oid}/发货{did}: 已超质保期，移除")
-                        succeeded.add((oid, did))
+                        no_ban.add((oid, did))
                     else:
                         _ar_log(f"订单{oid}/发货{did}: [{code}] {detail}")
 
-            # 移除成功的
+            # 记录成功补号的 delivery
+            for oid, did in succeeded:
+                state["replaced_deliveries"].append({"order_id": oid, "delivery_id": did})
+
+            # 移除成功和无需换号的
+            remove_set = succeeded | no_ban
             state["pending_tasks"] = [
                 t for t in state["pending_tasks"]
-                if (t["order_id"], t["delivery_id"]) not in succeeded
+                if (t["order_id"], t["delivery_id"]) not in remove_set
             ]
 
             if not state["pending_tasks"]:
@@ -648,9 +649,10 @@ async def start_auto_replace(request: Request) -> JSONResponse:
     state["interval"] = body.get("interval", 1)
 
     state["running"] = True
+    state["app"] = request.app
     state["logs"] = []
     state["pending_tasks"] = []
-    state["stock"] = 0
+    state["replaced_deliveries"] = []
     state["task"] = asyncio.create_task(_auto_replace_loop())
     return JSONResponse(content={"success": True})
 
@@ -673,7 +675,6 @@ async def get_auto_replace_status(request: Request) -> JSONResponse:
     return JSONResponse(content={
         "running": state["running"],
         "pending_tasks": state["pending_tasks"],
-        "stock": state["stock"],
         "interval": state["interval"],
         "last_check": state["last_check"],
         "logs": state["logs"][-100:],
@@ -704,7 +705,7 @@ def _restock_log(msg: str):
 
 
 def _refresh_warranty_list(token: str) -> set[str]:
-    """拉取所有 paid 订单，收集在保 delivery 中的 client_id"""
+    """拉取所有 paid+completed 订单，收集在保 delivery 中的 client_id"""
     all_orders = []
     page, page_size, total_pages = 1, 20, 1
     while page <= total_pages:
@@ -718,9 +719,9 @@ def _refresh_warranty_list(token: str) -> set[str]:
             total_pages = math.ceil(t / page_size) if t > 0 else 1
         page += 1
 
-    paid = [o for o in all_orders if o.get("status") == "paid"]
+    active = [o for o in all_orders if o.get("status") in ("paid", "completed")]
     client_ids: set[str] = set()
-    for order in paid:
+    for order in active:
         oid = order["id"]
         wh = order.get("warranty_hours", 0)
         try:
@@ -760,6 +761,77 @@ def _get_abnormal_disabled_creds(app) -> list[dict]:
             "client_id": c.client_id,
         })
     return result
+
+
+_DEFAULT_IMPORT_REGIONS = ["eu-north-1", "us-east-1"]
+
+
+async def _import_replaced_credentials(app, token: str, replaced: list[dict]):
+    """读取成功补号的 delivery 详情，提取凭据并添加到凭据库"""
+    from admin.types import AddCredentialRequest
+
+    service = app.state.admin_service
+    total_ok, total_fail = 0, 0
+
+    for item in replaced:
+        oid, did = item["order_id"], item["delivery_id"]
+        try:
+            detail = _kiroshop_get(
+                f"{KIROSHOP_BASE}/orders/{oid}",
+                token, "https://kiroshop.xyz/shop/orders",
+            )
+        except Exception as e:
+            _restock_log(f"获取订单{oid}详情失败: {e}")
+            continue
+
+        # 找到对应 delivery
+        target_delivery = None
+        for d in detail.get("deliveries", []):
+            if d.get("id") == did:
+                target_delivery = d
+                break
+        if not target_delivery:
+            _restock_log(f"订单{oid}中未找到发货{did}")
+            continue
+
+        for acc in target_delivery.get("account_data", []):
+            try:
+                cred_json = json.loads(acc.get("account_json", "{}"))
+                if isinstance(cred_json, list):
+                    cred_json = cred_json[0] if cred_json else {}
+                refresh_token = cred_json.get("refreshToken") or cred_json.get("refresh_token", "")
+                if not refresh_token:
+                    continue
+                client_id = (cred_json.get("clientId") or cred_json.get("client_id") or "").strip() or None
+                client_secret = (cred_json.get("clientSecret") or cred_json.get("client_secret") or "").strip() or None
+                auth_method = "idc" if (client_id and client_secret) else "social"
+                specified_region = (acc.get("region") or cred_json.get("region") or "").strip()
+                regions = [specified_region] + [r for r in _DEFAULT_IMPORT_REGIONS if r != specified_region] if specified_region else _DEFAULT_IMPORT_REGIONS
+
+                ok = False
+                for region in regions:
+                    try:
+                        req = AddCredentialRequest(
+                            refresh_token=refresh_token,
+                            auth_method=auth_method,
+                            client_id=client_id,
+                            client_secret=client_secret,
+                            auth_region=region,
+                            email=acc.get("email"),
+                        )
+                        await service.add_credential(req)
+                        ok = True
+                        break
+                    except Exception:
+                        continue
+                if ok:
+                    total_ok += 1
+                else:
+                    total_fail += 1
+            except Exception:
+                total_fail += 1
+
+    _restock_log(f"凭据导入完成: 成功 {total_ok}, 失败 {total_fail}")
 
 
 async def _auto_restock_loop():
@@ -815,23 +887,12 @@ async def _auto_restock_loop():
                 await asyncio.sleep(interval)
                 continue
 
-            cfg = {}
-            if _CONFIG_PATH.exists():
-                try:
-                    cfg = json.loads(_CONFIG_PATH.read_text("utf-8"))
-                except Exception:
-                    pass
-            token = cfg.get("token", "")
-            if not token:
-                _restock_log("无 kiroshop token，无法补货")
-                await asyncio.sleep(interval)
-                continue
-
             _restock_log("启动补货流程...")
             _auto_replace_state["running"] = True
+            _auto_replace_state["app"] = app
             _auto_replace_state["logs"] = []
             _auto_replace_state["pending_tasks"] = []
-            _auto_replace_state["stock"] = 0
+            _auto_replace_state["replaced_deliveries"] = []
             _auto_replace_state["interval"] = 1
             _auto_replace_state["task"] = asyncio.create_task(_auto_replace_loop())
 
@@ -842,6 +903,27 @@ async def _auto_restock_loop():
                     await replace_task
                 except Exception as e:
                     _restock_log(f"补货流程异常: {e}")
+
+            # 补货完成后：导入成功补号的凭据
+            replaced = _auto_replace_state.get("replaced_deliveries", [])
+            if replaced:
+                _restock_log(f"开始导入 {len(replaced)} 个补号批次的凭据...")
+                try:
+                    token = _relogin_and_save()
+                except Exception as e:
+                    _restock_log(f"导入前登录失败: {e}")
+                    token = ""
+                if token:
+                    await _import_replaced_credentials(app, token, replaced)
+
+            # 将触发补货的异常禁用凭据切换为手动禁用
+            service = app.state.admin_service
+            for c in warranted:
+                try:
+                    service.set_disabled(c["id"], True)
+                    _restock_log(f"凭据 #{c['id']} 已切换为手动禁用")
+                except Exception as e:
+                    _restock_log(f"切换凭据 #{c['id']} 禁用状态失败: {e}")
 
             _restock_log("补货流程结束，继续监控...")
             await asyncio.sleep(interval)

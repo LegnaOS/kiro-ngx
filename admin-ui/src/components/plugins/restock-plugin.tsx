@@ -662,7 +662,6 @@ export default function RestockPlugin() {
               </Badge>
               {arStatus && (
                 <>
-                  <span className="text-muted-foreground">库存: {arStatus.stock ?? '-'}</span>
                   <span className="text-muted-foreground">待补号: {arStatus.pending_tasks?.length ?? 0}</span>
                   {arStatus.last_check && <span className="text-muted-foreground">上次检查: {arStatus.last_check}</span>}
                 </>
