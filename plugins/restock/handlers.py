@@ -138,7 +138,7 @@ async def get_restock_inventory(request: Request) -> JSONResponse:
         return JSONResponse(status_code=502, content={"error": str(e)})
 
 
-# --- 订单列表（自动分页 + 过滤已完成/已取消）---
+# --- 订单列表（自动分页，仅过滤已取消）---
 async def get_restock_orders(request: Request) -> JSONResponse:
     token = _extract_token(request)
     if not token:
@@ -156,7 +156,7 @@ async def get_restock_orders(request: Request) -> JSONResponse:
                 total = result.get("total", 0)
                 total_pages = math.ceil(total / page_size) if total > 0 else 1
             page += 1
-        filtered = [o for o in all_orders if o.get("status") not in ("completed", "cancelled")]
+        filtered = [o for o in all_orders if o.get("status") != "cancelled"]
         return JSONResponse(content={"orders": filtered, "total": len(filtered)})
     except HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")

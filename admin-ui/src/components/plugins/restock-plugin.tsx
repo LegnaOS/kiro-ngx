@@ -73,6 +73,8 @@ export default function RestockPlugin() {
   const [replacingDeliveryId, setReplacingDeliveryId] = useState<number | null>(null)
   const [deliveringOrderId, setDeliveringOrderId] = useState<number | null>(null)
   const [deliverCount, setDeliverCount] = useState('')
+  // 全部导入
+  const [importingAll, setImportingAll] = useState(false)
   // 过保分析
   const [analyzeResult, setAnalyzeResult] = useState<any | null>(null)
   const [loadingAnalyze, setLoadingAnalyze] = useState(false)
@@ -306,6 +308,96 @@ export default function RestockPlugin() {
     finally { setDeliveringOrderId(null) }
   }
 
+  // 全部导入：遍历所有订单，未过保+未封禁的账号全部导入
+  const handleImportAll = async () => {
+    if (!requireToken()) return
+    if (!orders || orders.length === 0) { toast.error('请先查询订单'); return }
+    setImportingAll(true)
+    let totalSuccess = 0, totalSkipped = 0, totalBannedSkipped = 0, totalFail = 0
+
+    try {
+      // 获取已有凭据 hash 集合
+      const creds = await getCredentials().catch(() => null)
+      const existingHashes = new Set(
+        creds?.credentials.map(c => c.refreshTokenHash).filter(Boolean) as string[] ?? []
+      )
+
+      for (const order of orders) {
+        const warrantyHours = order.warranty_hours ?? 0
+        let detail: any
+        try {
+          detail = await getRestockOrderDetail(config.token, order.id)
+        } catch { continue }
+
+        // 封禁检测
+        let banMap = new Map<number, Set<string>>()
+        try {
+          const banRes = await checkRestockBan(config.token, order.id)
+          for (const d of banRes.deliveries || []) {
+            const bannedEmails = new Set(d.results?.filter(r => r.banned).map(r => r.email) ?? [])
+            banMap.set(d.delivery_id, bannedEmails)
+          }
+        } catch { /* 封禁检测失败不阻塞 */ }
+
+        for (const d of detail.deliveries || []) {
+          const wh = (detail as any).warranty_hours ?? warrantyHours
+          const warranty = checkWarranty(d.delivered_at, wh)
+          if (warranty.expired) continue
+
+          const bannedEmails = banMap.get(d.id) ?? new Set()
+          for (const acc of d.account_data || []) {
+            const email = acc.email || ''
+            if (bannedEmails.has(email)) { totalBannedSkipped++; continue }
+            try {
+              const jsonArr = JSON.parse(acc.account_json)
+              const cred = Array.isArray(jsonArr) ? jsonArr[0] : jsonArr
+              if (!cred) continue
+              const refreshToken = cred.refreshToken || cred.refresh_token || ''
+              if (!refreshToken) continue
+              const hash = await sha256Hex(refreshToken)
+              if (existingHashes.has(hash)) { totalSkipped++; continue }
+              const clientId = (cred.clientId || cred.client_id || '').trim() || undefined
+              const clientSecret = (cred.clientSecret || cred.client_secret || '').trim() || undefined
+              const authMethod = (clientId && clientSecret) ? 'idc' as const : 'social' as const
+              const base = { refreshToken, authMethod, clientId, clientSecret }
+              const importRegions = (() => {
+                try { const s = localStorage.getItem('kiro-import-regions'); if (s) return JSON.parse(s) as string[] } catch {}
+                return DEFAULT_REGIONS
+              })()
+              const specifiedRegion = (acc.region || cred.region || '').trim()
+              const regionsToTry = specifiedRegion
+                ? [specifiedRegion, ...importRegions.filter((r: string) => r !== specifiedRegion)]
+                : importRegions
+              let ok = false
+              for (const region of regionsToTry) {
+                try {
+                  await addCredential({ ...base, authRegion: region })
+                  ok = true
+                  break
+                } catch {}
+              }
+              if (ok) { totalSuccess++; existingHashes.add(hash) } else { totalFail++ }
+            } catch { totalFail++ }
+          }
+        }
+      }
+    } catch (e: any) {
+      toast.error(e?.message || '导入异常')
+    }
+
+    setImportingAll(false)
+    const parts: string[] = []
+    if (totalSuccess) parts.push(`成功 ${totalSuccess}`)
+    if (totalSkipped) parts.push(`跳过已存在 ${totalSkipped}`)
+    if (totalBannedSkipped) parts.push(`跳过封号 ${totalBannedSkipped}`)
+    if (totalFail) parts.push(`失败 ${totalFail}`)
+    if (totalFail === 0) {
+      toast.success(`全部导入完成: ${parts.join(', ')}`)
+    } else {
+      toast.warning(`全部导入完成: ${parts.join(', ')}`)
+    }
+  }
+
   // 过保分析
   const handleAnalyze = async () => {
     if (!requireToken()) return
@@ -477,6 +569,11 @@ export default function RestockPlugin() {
                 {loadingOrders ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4 mr-1" />}
                 {loadingOrders ? '查询中...' : '查询'}
               </Button>
+              <Button size="sm" variant="outline" onClick={handleImportAll}
+                disabled={importingAll || !orders || orders.length === 0}>
+                {importingAll ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Download className="h-4 w-4 mr-1" />}
+                {importingAll ? '导入中...' : '全部导入'}
+              </Button>
             </div>
           </CardHeader>
           <CardContent className="p-0">
@@ -498,7 +595,7 @@ export default function RestockPlugin() {
                       <span className="font-medium">#{o.id}</span>
                       <span className="text-muted-foreground truncate">{o.order_no}</span>
                       <span className="ml-auto text-xs text-muted-foreground">x{o.quantity} ￥{o.total_price}</span>
-                      <Badge variant={o.status === 'paid' ? 'success' : 'warning'} className="ml-1">
+                      <Badge variant={o.status === 'paid' ? 'success' : o.status === 'completed' ? 'secondary' : 'warning'} className="ml-1">
                         {STATUS_MAP[o.status] || o.status}
                       </Badge>
                     </div>
