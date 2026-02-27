@@ -376,14 +376,14 @@ async def analyze_restock_orders(request: Request) -> JSONResponse:
                 total_pages = math.ceil(total / page_size) if total > 0 else 1
             page += 1
 
-        paid_orders = [o for o in all_orders if o.get("status") == "paid"]
-        if not paid_orders:
+        active_orders = [o for o in all_orders if o.get("status") in ("paid", "completed")]
+        if not active_orders:
             return JSONResponse(content={"pending_tasks": [], "summaries": []})
 
         pending_tasks = []
         summaries = []
 
-        for order in paid_orders:
+        for order in active_orders:
             oid = order["id"]
             warranty_hours = order.get("warranty_hours", 0)
 
