@@ -232,6 +232,8 @@ async def get_restock_config(request: Request) -> JSONResponse:
             "email": data.get("email", ""),
             "password": data.get("password", ""),
             "token": data.get("token", ""),
+            "ar_interval": data.get("ar_interval", "1"),
+            "restock_interval": data.get("restock_interval", "30"),
         })
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -250,7 +252,7 @@ async def save_restock_config(request: Request) -> JSONResponse:
         except Exception:
             pass
 
-    for key in ("email", "password", "token"):
+    for key in ("email", "password", "token", "ar_interval", "restock_interval"):
         if key in body:
             existing[key] = body[key]
 

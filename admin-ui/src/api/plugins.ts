@@ -36,6 +36,8 @@ export interface RestockConfig {
   email: string
   password: string
   token: string
+  ar_interval?: string
+  restock_interval?: string
 }
 
 export async function getRestockConfig(): Promise<RestockConfig> {

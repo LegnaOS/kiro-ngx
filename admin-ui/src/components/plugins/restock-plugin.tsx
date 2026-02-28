@@ -93,7 +93,12 @@ export default function RestockPlugin() {
   // 初始化从服务端加载配置
   useEffect(() => {
     getRestockConfig()
-      .then(c => { setConfig(c); setConfigLoaded(true) })
+      .then(c => {
+        setConfig(c)
+        if (c.ar_interval) setArInterval(c.ar_interval)
+        if (c.restock_interval) setRestockInterval(c.restock_interval)
+        setConfigLoaded(true)
+      })
       .catch(() => setConfigLoaded(true))
   }, [])
 
@@ -448,12 +453,37 @@ export default function RestockPlugin() {
   }
 
   // 轮询自动补号状态（运行中 1秒，停止时 5秒）
+  const prevArStatus = useRef<any>(null)
+  const importTimeout = useRef<ReturnType<typeof setTimeout>>()
+
   useEffect(() => {
     pollArStatus()
     const ms = arStatus?.running ? 1000 : 5000
     arPollRef.current = setInterval(pollArStatus, ms)
     return () => { if (arPollRef.current) clearInterval(arPollRef.current) }
   }, [pollArStatus, arStatus?.running])
+
+  // 监控自动补号结束并执行导入
+  useEffect(() => {
+    if (prevArStatus.current?.running === true && arStatus?.running === false) {
+      if (arStatus?.replaced_count && arStatus.replaced_count > 0) {
+        toast.info('检测到自动补号完成，稍后将自动导入新凭据...')
+        if (importTimeout.current) clearTimeout(importTimeout.current)
+        importTimeout.current = setTimeout(async () => {
+          try {
+            await fetchOrders()
+            // Wait briefly for orders state to update before importing
+            setTimeout(() => {
+              handleImportAll()
+            }, 1000)
+          } catch (e) {
+            console.error('Auto import failed after replace:', e)
+          }
+        }, 5000) // 5秒延迟避免过于频繁
+      }
+    }
+    prevArStatus.current = arStatus
+  }, [arStatus?.running, arStatus?.replaced_count])
 
   // 自动补货
   const pollRestockStatus = useCallback(async () => {
@@ -512,11 +542,11 @@ export default function RestockPlugin() {
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-            <Input type="text" autoComplete="off" placeholder="邮箱"
+            <Input type="text" autoComplete="new-password" placeholder="邮箱"
               value={config.email} onChange={e => updateConfig({ email: e.target.value })} />
-            <Input type="text" autoComplete="off" placeholder="密码"
+            <Input type="password" autoComplete="new-password" placeholder="密码"
               value={config.password} onChange={e => updateConfig({ password: e.target.value })} />
-            <Input type="text" autoComplete="off" placeholder="Token（登录后自动填充）"
+            <Input type="password" autoComplete="new-password" placeholder="Token（登录后自动填充）"
               value={config.token} onChange={e => updateConfig({ token: e.target.value })} />
           </div>
           <div className="flex gap-2">
@@ -755,7 +785,10 @@ export default function RestockPlugin() {
                 <div className="flex items-center gap-1">
                   <span className="text-xs text-muted-foreground">间隔</span>
                   <Input type="number" min="1" className="w-16 h-8 text-xs" value={arInterval}
-                    onChange={e => setArInterval(e.target.value)} disabled={arStatus?.running} />
+                    onChange={e => {
+                      setArInterval(e.target.value)
+                      updateConfig({ ar_interval: e.target.value })
+                    }} disabled={arStatus?.running} />
                   <span className="text-xs text-muted-foreground">秒</span>
                 </div>
                 {arStatus?.running ? (
@@ -853,7 +886,10 @@ export default function RestockPlugin() {
                 <div className="flex items-center gap-1">
                   <span className="text-xs text-muted-foreground">检测间隔</span>
                   <Input type="number" min="5" className="w-16 h-8 text-xs" value={restockInterval}
-                    onChange={e => setRestockInterval(e.target.value)} disabled={restockStatus?.running} />
+                    onChange={e => {
+                      setRestockInterval(e.target.value)
+                      updateConfig({ restock_interval: e.target.value })
+                    }} disabled={restockStatus?.running} />
                   <span className="text-xs text-muted-foreground">秒</span>
                 </div>
                 {restockStatus?.running ? (
