@@ -669,21 +669,6 @@ class MultiTokenManager:
             with self._lock:
                 best = self._select_next_credential(model)
 
-                # 自愈：如果所有凭据都被自动禁用，重置
-                if best is None:
-                    has_auto_disabled = any(
-                        e.disabled and e.disabled_reason == _DisabledReason.TOO_MANY_FAILURES
-                        for e in self._entries
-                    )
-                    if has_auto_disabled:
-                        logger.warning("所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用")
-                        for e in self._entries:
-                            if e.disabled_reason == _DisabledReason.TOO_MANY_FAILURES:
-                                e.disabled = False
-                                e.disabled_reason = None
-                                e.failure_count = 0
-                        best = self._select_next_credential(model)
-
                 if best:
                     cid, cred = best
                     self._current_id = cid
@@ -697,7 +682,7 @@ class MultiTokenManager:
                 return ctx
             except Exception as e:
                 logger.warning("凭据 #%d Token 刷新失败，尝试下一个凭据: %s", cid, e)
-                self._switch_to_next_by_priority()
+                self.report_failure(cid)
                 tried_count += 1
 
     async def _try_ensure_token(self, cid: int, credentials: KiroCredentials) -> CallContext:
