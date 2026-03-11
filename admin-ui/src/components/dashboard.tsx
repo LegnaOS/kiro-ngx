@@ -17,6 +17,7 @@ import {
 } from '@/api/credentials'
 import { HomeTab } from '@/components/tabs/home-tab'
 import { CredentialsTab } from '@/components/tabs/credentials-tab'
+import { LogsTab } from '@/components/tabs/logs-tab'
 import { StrategyTab } from '@/components/tabs/strategy-tab'
 import { PluginsTab } from '@/components/tabs/plugins-tab'
 
@@ -24,11 +25,12 @@ interface DashboardProps {
   onLogout: () => void
 }
 
-type TabId = 'home' | 'credentials' | 'strategy' | 'plugins'
+type TabId = 'home' | 'credentials' | 'logs' | 'strategy' | 'plugins'
 
 const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
   { id: 'home', label: '首页', icon: <Home className="h-4 w-4" /> },
   { id: 'credentials', label: '凭据管理', icon: <KeyRound className="h-4 w-4" /> },
+  { id: 'logs', label: '日志', icon: <ScrollText className="h-4 w-4" /> },
   { id: 'strategy', label: '策略配置', icon: <Settings className="h-4 w-4" /> },
   { id: 'plugins', label: '插件', icon: <Puzzle className="h-4 w-4" /> },
 ]
@@ -286,6 +288,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <HomeTab credentialCount={data?.total || 0} availableCount={data?.available || 0} />
         )}
         {activeTab === 'credentials' && <CredentialsTab />}
+        {activeTab === 'logs' && <LogsTab />}
         {activeTab === 'strategy' && <StrategyTab />}
         {activeTab === 'plugins' && <PluginsTab />}
       </main>

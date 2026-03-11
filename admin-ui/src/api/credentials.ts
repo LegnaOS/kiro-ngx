@@ -11,6 +11,7 @@ import type {
   RequestStats,
   ModelInfo,
   RoutingConfig,
+  RuntimeLogResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -187,6 +188,16 @@ export async function getLogStatus(): Promise<{ enabled: boolean }> {
 
 export async function setLogStatus(enabled: boolean): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/log', { enabled })
+  return data
+}
+
+export async function getRuntimeLogs(params?: {
+  cursor?: number
+  limit?: number
+  level?: string
+  q?: string
+}): Promise<RuntimeLogResponse> {
+  const { data } = await api.get<RuntimeLogResponse>('/logs/runtime', { params })
   return data
 }
 

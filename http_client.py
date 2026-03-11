@@ -11,6 +11,9 @@ DEFAULT_LIMITS = httpx.Limits(
     max_connections=400,
     keepalive_expiry=120.0,
 )
+DEFAULT_POOL_TIMEOUT_SECS = 8.0
+DEFAULT_CONNECT_TIMEOUT_SECS = 30.0
+DEFAULT_WRITE_TIMEOUT_SECS = 30.0
 
 
 @dataclass(frozen=True)
@@ -42,8 +45,15 @@ def build_client(
         else:
             proxy_url = proxy.url
 
+    timeout = httpx.Timeout(
+        read=float(timeout_secs),
+        connect=min(DEFAULT_CONNECT_TIMEOUT_SECS, float(timeout_secs)),
+        write=min(DEFAULT_WRITE_TIMEOUT_SECS, float(timeout_secs)),
+        pool=min(DEFAULT_POOL_TIMEOUT_SECS, float(timeout_secs)),
+    )
+
     return httpx.AsyncClient(
-        timeout=httpx.Timeout(timeout_secs, connect=30.0),
+        timeout=timeout,
         proxy=proxy_url,
         limits=DEFAULT_LIMITS,
         follow_redirects=True,
@@ -67,8 +77,15 @@ def build_sync_client(
         else:
             proxy_url = proxy.url
 
+    timeout = httpx.Timeout(
+        read=float(timeout_secs),
+        connect=min(DEFAULT_CONNECT_TIMEOUT_SECS, float(timeout_secs)),
+        write=min(DEFAULT_WRITE_TIMEOUT_SECS, float(timeout_secs)),
+        pool=min(DEFAULT_POOL_TIMEOUT_SECS, float(timeout_secs)),
+    )
+
     return httpx.Client(
-        timeout=httpx.Timeout(timeout_secs, connect=30.0),
+        timeout=timeout,
         proxy=proxy_url,
         limits=DEFAULT_LIMITS,
         follow_redirects=True,

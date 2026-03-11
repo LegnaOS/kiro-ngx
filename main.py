@@ -20,6 +20,7 @@ from anthropic_api.router import create_router_with_provider
 from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middleware
 from admin import AdminService, AdminAuthMiddleware, create_admin_router
 from admin.ui_router import create_admin_ui_router
+from admin.runtime_log import init_runtime_log_buffer
 from plugin_loader import load_plugins, get_loaded_plugins
 from anthropic_api.message_log import init_message_logger
 from token_usage import init_token_usage_tracker
@@ -31,6 +32,8 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+init_runtime_log_buffer()
 
 
 def main():

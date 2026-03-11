@@ -207,6 +207,9 @@ class KiroProvider:
                 else:
                     response = await client.post(url, headers=headers, content=request_body.encode("utf-8"))
             except Exception as e:
+                if isinstance(e, httpx.PoolTimeout):
+                    logger.error("API 连接池等待超时，立即失败以避免请求积压: %s", e)
+                    raise RuntimeError(f"{api_type} API 连接池等待超时: {e}")
                 logger.warning("API 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e
                 if attempt + 1 < max_retries:
@@ -288,6 +291,9 @@ class KiroProvider:
             try:
                 response = await client.post(url, headers=headers, content=request_body.encode("utf-8"))
             except Exception as e:
+                if isinstance(e, httpx.PoolTimeout):
+                    logger.error("MCP 连接池等待超时，立即失败以避免请求积压: %s", e)
+                    raise RuntimeError(f"MCP 连接池等待超时: {e}")
                 logger.warning("MCP 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e
                 if attempt + 1 < max_retries:

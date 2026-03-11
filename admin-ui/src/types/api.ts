@@ -126,3 +126,17 @@ export interface RoutingConfig {
   freeModels: string[]
   customModels?: string[]
 }
+
+export interface RuntimeLogEntry {
+  seq: number
+  timestamp: string
+  level: string
+  logger: string
+  message: string
+}
+
+export interface RuntimeLogResponse {
+  entries: RuntimeLogEntry[]
+  nextCursor: number
+  bufferSize: number
+}

@@ -26,6 +26,7 @@ from token_usage import get_token_usage_tracker
 logger = logging.getLogger(__name__)
 
 PING_INTERVAL_SECS = 25
+MAX_STREAM_IDLE_PINGS = 8
 
 
 async def _aclose_response_quietly(response) -> None:
@@ -35,20 +36,31 @@ async def _aclose_response_quietly(response) -> None:
         await response.aclose()
 
 
-async def _iter_stream_chunks_with_ping(response, ping_interval: float):
+async def _iter_stream_chunks_with_ping(
+    response,
+    ping_interval: float,
+    max_idle_pings: int = MAX_STREAM_IDLE_PINGS,
+):
     """轮询流式分片，超时仅产出 ping 信号，不取消底层读取任务。"""
     chunk_iter = response.aiter_bytes().__aiter__()
     pending_task = asyncio.create_task(chunk_iter.__anext__())
+    idle_pings = 0
     try:
         while True:
             done, _ = await asyncio.wait({pending_task}, timeout=ping_interval)
             if not done:
+                idle_pings += 1
+                if max_idle_pings > 0 and idle_pings >= max_idle_pings:
+                    raise TimeoutError(
+                        f"上游流空闲超时：连续 {idle_pings} 次 ping 周期未收到数据"
+                    )
                 yield None
                 continue
             try:
                 chunk = pending_task.result()
             except StopAsyncIteration:
                 break
+            idle_pings = 0
             yield chunk
             pending_task = asyncio.create_task(chunk_iter.__anext__())
     finally:

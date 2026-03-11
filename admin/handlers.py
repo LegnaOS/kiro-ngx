@@ -694,3 +694,40 @@ async def set_log_status(request: Request) -> JSONResponse:
         return JSONResponse(status_code=500, content={"success": False, "message": "日志模块未初始化"})
     ml.set_enabled(enabled)
     return JSONResponse(content=SuccessResponse.new(f"消息日志已{'开启' if enabled else '关闭'}").to_dict())
+
+
+async def get_runtime_logs(request: Request) -> JSONResponse:
+    """GET /logs/runtime - 获取运行时日志尾部/增量片段"""
+    from admin.runtime_log import (
+        DEFAULT_RUNTIME_LOG_LIMIT,
+        MAX_RUNTIME_LOG_LIMIT,
+        get_runtime_log_buffer,
+    )
+
+    def _parse_int(name: str, default: int) -> int:
+        raw = request.query_params.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    limit = _parse_int("limit", DEFAULT_RUNTIME_LOG_LIMIT)
+    limit = max(1, min(limit, MAX_RUNTIME_LOG_LIMIT))
+    cursor = _parse_int("cursor", 0)
+    level = request.query_params.get("level") or None
+    keyword = (request.query_params.get("q") or "").strip() or None
+
+    buf = get_runtime_log_buffer()
+    if not buf:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "运行时日志缓冲区未初始化"},
+        )
+
+    if cursor > 0:
+        result = buf.since(cursor=cursor, limit=limit, level=level, keyword=keyword)
+    else:
+        result = buf.tail(limit=limit, level=level, keyword=keyword)
+    return JSONResponse(content=result)

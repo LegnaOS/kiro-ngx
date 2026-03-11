@@ -32,6 +32,15 @@ class _FakeResponse:
         return self._iterator
 
 
+class _NeverChunkIter:
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.sleep(10)
+        raise StopAsyncIteration
+
+
 class StreamPingWaitTest(unittest.IsolatedAsyncioTestCase):
     async def test_ping_timeout_does_not_cancel_underlying_read(self):
         iterator = _FakeChunkIter()
@@ -44,6 +53,17 @@ class StreamPingWaitTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(None, outputs)
         self.assertIn(b"chunk-1", outputs)
         self.assertFalse(iterator.cancelled)
+
+    async def test_idle_ping_limit_raises_timeout(self):
+        response = _FakeResponse(_NeverChunkIter())
+
+        with self.assertRaises(TimeoutError):
+            async for _ in _iter_stream_chunks_with_ping(
+                response,
+                ping_interval=0.01,
+                max_idle_pings=2,
+            ):
+                pass
 
 
 if __name__ == "__main__":
