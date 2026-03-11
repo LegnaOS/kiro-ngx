@@ -2,12 +2,11 @@
 
 import hmac
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import Request, Response
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.datastructures import Headers
 from starlette.middleware.cors import CORSMiddleware
 
 from common.auth import extract_api_key
@@ -24,24 +23,30 @@ class AppState:
     profile_arn: Optional[str] = None
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """API Key 认证中间件"""
+class AuthMiddleware:
+    """API Key 认证中间件（纯 ASGI，避免 BaseHTTPMiddleware 开销）"""
 
     def __init__(self, app, state: AppState):
-        super().__init__(app)
+        self.app = app
         self.state = state
 
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        # 只拦截 Anthropic API 路径，其他路径直接放行
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
         if not (path.startswith("/v1/") or path.startswith("/cc/")):
-            return await call_next(request)
-        key = extract_api_key(dict(request.headers))
+            await self.app(scope, receive, send)
+            return
+        key = extract_api_key(Headers(scope=scope))
         if key and hmac.compare_digest(key, self.state.api_key):
-            request.state.app_state = self.state
-            return await call_next(request)
+            scope.setdefault("state", {})["app_state"] = self.state
+            await self.app(scope, receive, send)
+            return
         error = ErrorResponse.authentication_error()
-        return JSONResponse(status_code=401, content=error.to_dict())
+        response = JSONResponse(status_code=401, content=error.to_dict())
+        await response(scope, receive, send)
 
 
 def add_cors_middleware(app):

@@ -1,7 +1,9 @@
 """认证工具函数 - 参考 src/common/auth.rs"""
 
+from collections.abc import Mapping
 
-def extract_api_key(headers: dict) -> str | None:
+
+def extract_api_key(headers: Mapping[str, str]) -> str | None:
     """从请求头中提取 API Key
 
     支持两种方式：

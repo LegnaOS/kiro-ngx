@@ -110,22 +110,25 @@ def _call_remote_count_tokens(
     tools: Optional[List[Dict[str, Any]]],
 ) -> int:
     client = build_sync_client(config.proxy, timeout_secs=300)
-    body: Dict[str, Any] = {"model": model, "messages": messages}
-    if system:
-        body["system"] = system
-    if tools:
-        body["tools"] = tools
+    try:
+        body: Dict[str, Any] = {"model": model, "messages": messages}
+        if system:
+            body["system"] = system
+        if tools:
+            body["tools"] = tools
 
-    headers = {"Content-Type": "application/json"}
-    if config.api_key:
-        if config.auth_type == "bearer":
-            headers["Authorization"] = f"Bearer {config.api_key}"
-        else:
-            headers["x-api-key"] = config.api_key
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            if config.auth_type == "bearer":
+                headers["Authorization"] = f"Bearer {config.api_key}"
+            else:
+                headers["x-api-key"] = config.api_key
 
-    resp = client.post(api_url, json=body, headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("input_tokens", 1)
+        resp = client.post(api_url, json=body, headers=headers)
+        resp.raise_for_status()
+        return resp.json().get("input_tokens", 1)
+    finally:
+        client.close()
 
 
 def _estimate_schema_tokens(obj: Any) -> int:

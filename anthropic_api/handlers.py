@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 PING_INTERVAL_SECS = 25
 
 
+async def _aclose_response_quietly(response) -> None:
+    if response is None:
+        return
+    with contextlib.suppress(Exception):
+        await response.aclose()
+
+
 async def _iter_stream_chunks_with_ping(response, ping_interval: float):
     """轮询流式分片，超时仅产出 ping 信号，不取消底层读取任务。"""
     chunk_iter = response.aiter_bytes().__aiter__()
@@ -148,44 +155,45 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
         from kiro.parser.decoder import EventStreamDecoder
         from kiro.parser.error import BufferOverflow
 
-        for evt in initial_events:
-            yield evt.to_sse_string()
-
-        ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
-        decoder = EventStreamDecoder()
         try:
-            async for chunk in _iter_stream_chunks_with_ping(response, PING_INTERVAL_SECS):
-                if chunk is None:
-                    yield ping_event
-                    continue
-                try:
-                    decoder.feed(chunk)
-                except BufferOverflow as e:
-                    logger.warning("缓冲区溢出: %s", e)
-                    continue
-                for frame in decoder.decode_all():
-                    event = _parse_event(frame)
-                    if event is not None:
-                        for sse in ctx.process_kiro_event(event):
-                            yield sse.to_sse_string()
-        except Exception as e:
-            logger.error("读取响应流失败: %s", e)
+            for evt in initial_events:
+                yield evt.to_sse_string()
 
-        for sse in ctx.generate_final_events():
-            yield sse.to_sse_string()
+            ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
+            decoder = EventStreamDecoder()
+            try:
+                async for chunk in _iter_stream_chunks_with_ping(response, PING_INTERVAL_SECS):
+                    if chunk is None:
+                        yield ping_event
+                        continue
+                    try:
+                        decoder.feed(chunk)
+                    except BufferOverflow as e:
+                        logger.warning("缓冲区溢出: %s", e)
+                        continue
+                    for frame in decoder.decode_all():
+                        event = _parse_event(frame)
+                        if event is not None:
+                            for sse in ctx.process_kiro_event(event):
+                                yield sse.to_sse_string()
+            except Exception as e:
+                logger.error("读取响应流失败: %s", e)
 
-        # 记录流式响应日志
-        msg_logger = get_message_logger()
-        if msg_logger and msg_logger.enabled:
-            final_input = ctx.context_input_tokens if ctx.context_input_tokens is not None else input_tokens
-            msg_logger.log_stream_text(
-                model=model, text=ctx.accumulated_text,
-                stop_reason=ctx.state_manager.get_stop_reason(),
-                usage={"input_tokens": final_input, "output_tokens": ctx.output_tokens},
-            )
+            for sse in ctx.generate_final_events():
+                yield sse.to_sse_string()
 
-        # 上报 token 用量
-        _report_token_usage(model, ctx.context_input_tokens or input_tokens, ctx.output_tokens)
+            msg_logger = get_message_logger()
+            if msg_logger and msg_logger.enabled:
+                final_input = ctx.context_input_tokens if ctx.context_input_tokens is not None else input_tokens
+                msg_logger.log_stream_text(
+                    model=model, text=ctx.accumulated_text,
+                    stop_reason=ctx.state_manager.get_stop_reason(),
+                    usage={"input_tokens": final_input, "output_tokens": ctx.output_tokens},
+                )
+
+            _report_token_usage(model, ctx.context_input_tokens or input_tokens, ctx.output_tokens)
+        finally:
+            await _aclose_response_quietly(response)
 
     return StreamingResponse(
         event_generator(),
@@ -207,43 +215,44 @@ async def _handle_stream_request_buffered(provider, request_body: str, model: st
         from kiro.parser.decoder import EventStreamDecoder
         from kiro.parser.error import BufferOverflow
 
-        decoder = EventStreamDecoder()
-        ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
-
         try:
-            async for chunk in _iter_stream_chunks_with_ping(response, PING_INTERVAL_SECS):
-                if chunk is None:
-                    yield ping_event
-                    continue
-                try:
-                    decoder.feed(chunk)
-                except BufferOverflow as e:
-                    logger.warning("缓冲区溢出: %s", e)
-                    continue
-                for frame in decoder.decode_all():
-                    event = _parse_event(frame)
-                    if event is not None:
-                        buf_ctx.process_and_buffer(event)
-        except Exception as e:
-            logger.error("读取响应流失败: %s", e)
+            decoder = EventStreamDecoder()
+            ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
 
-        for sse in buf_ctx.finish_and_get_all_events():
-            yield sse.to_sse_string()
+            try:
+                async for chunk in _iter_stream_chunks_with_ping(response, PING_INTERVAL_SECS):
+                    if chunk is None:
+                        yield ping_event
+                        continue
+                    try:
+                        decoder.feed(chunk)
+                    except BufferOverflow as e:
+                        logger.warning("缓冲区溢出: %s", e)
+                        continue
+                    for frame in decoder.decode_all():
+                        event = _parse_event(frame)
+                        if event is not None:
+                            buf_ctx.process_and_buffer(event)
+            except Exception as e:
+                logger.error("读取响应流失败: %s", e)
 
-        # 记录流式响应日志
-        msg_logger = get_message_logger()
-        if msg_logger and msg_logger.enabled:
+            for sse in buf_ctx.finish_and_get_all_events():
+                yield sse.to_sse_string()
+
+            msg_logger = get_message_logger()
+            if msg_logger and msg_logger.enabled:
+                inner = buf_ctx.inner
+                final_input = inner.context_input_tokens if inner.context_input_tokens is not None else estimated_input_tokens
+                msg_logger.log_stream_text(
+                    model=model, text=inner.accumulated_text,
+                    stop_reason=inner.state_manager.get_stop_reason(),
+                    usage={"input_tokens": final_input, "output_tokens": inner.output_tokens},
+                )
+
             inner = buf_ctx.inner
-            final_input = inner.context_input_tokens if inner.context_input_tokens is not None else estimated_input_tokens
-            msg_logger.log_stream_text(
-                model=model, text=inner.accumulated_text,
-                stop_reason=inner.state_manager.get_stop_reason(),
-                usage={"input_tokens": final_input, "output_tokens": inner.output_tokens},
-            )
-
-        # 上报 token 用量
-        inner = buf_ctx.inner
-        _report_token_usage(model, inner.context_input_tokens or estimated_input_tokens, inner.output_tokens)
+            _report_token_usage(model, inner.context_input_tokens or estimated_input_tokens, inner.output_tokens)
+        finally:
+            await _aclose_response_quietly(response)
 
     return StreamingResponse(
         event_generator(),
@@ -312,6 +321,8 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
         return JSONResponse(status_code=502, content=ErrorResponse.new(
             "api_error", f"读取上游响应失败: {e}",
         ).to_dict())
+    finally:
+        await _aclose_response_quietly(response)
     decoder = EventStreamDecoder()
     decoder.feed(body_bytes)
 
@@ -622,6 +633,8 @@ async def _handle_stream_auto_continue(
                                 max_yielded_index = actual_idx
             except Exception as e:
                 logger.error("读取响应流失败 (第 %d 轮): %s", round_idx + 1, e)
+            finally:
+                await _aclose_response_quietly(current_response)
 
             ws_tool_uses = ctx.web_search_tool_uses
             if not ws_tool_uses:

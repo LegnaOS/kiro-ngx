@@ -6,6 +6,13 @@ from typing import Optional
 import httpx
 
 
+DEFAULT_LIMITS = httpx.Limits(
+    max_keepalive_connections=200,
+    max_connections=400,
+    keepalive_expiry=120.0,
+)
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     url: str
@@ -38,6 +45,7 @@ def build_client(
     return httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_secs, connect=30.0),
         proxy=proxy_url,
+        limits=DEFAULT_LIMITS,
         follow_redirects=True,
         **transport_kwargs,
     )
@@ -62,5 +70,6 @@ def build_sync_client(
     return httpx.Client(
         timeout=httpx.Timeout(timeout_secs, connect=30.0),
         proxy=proxy_url,
+        limits=DEFAULT_LIMITS,
         follow_redirects=True,
     )
