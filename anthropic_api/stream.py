@@ -17,6 +17,10 @@ QUOTE_CHARS = {ord(c) for c in '`"\'\\#!@$%^&*()-_=+[]{};:<>,.?/'}
 CONTEXT_WINDOW_SIZE = 200_000
 
 
+class IncompleteToolUseError(RuntimeError):
+    """流结束时 tool_use 未完整闭合。"""
+
+
 def _is_quote_char(buffer: str, pos: int) -> bool:
     if 0 <= pos < len(buffer):
         return ord(buffer[pos]) < 128 and ord(buffer[pos]) in QUOTE_CHARS
@@ -529,15 +533,19 @@ class StreamContext:
             self.state_manager.set_stop_reason("max_tokens")
             events.extend(self._create_text_delta_events(" "))
 
-        # 丢弃未完成的 tool_use（缺少 stop=true），避免写入空/半截 tool_call。
+        # 未完成的 tool_use 不应伪装成正常结束，否则客户端会把半截响应当成成功。
         if self._tool_json_buffers:
+            fragments = []
             for tid in list(self._tool_json_buffers.keys()):
-                logger.warning(
-                    "丢弃未完成 tool_use: tool_use_id=%s, pending_input_len=%d",
-                    tid, len(self._tool_json_buffers.get(tid, "")),
+                pending_len = len(self._tool_json_buffers.get(tid, ""))
+                logger.error(
+                    "检测到未完成 tool_use，中止流式响应: tool_use_id=%s, pending_input_len=%d",
+                    tid, pending_len,
                 )
+                fragments.append(f"{tid}:{pending_len}")
                 self._tool_json_buffers.pop(tid, None)
                 self.tool_block_indices.pop(tid, None)
+            raise IncompleteToolUseError("未完成 tool_use: " + ", ".join(fragments))
 
         final_input = self.context_input_tokens if self.context_input_tokens is not None else self.input_tokens
         events.extend(self.state_manager.generate_final_events(final_input, self.output_tokens))
