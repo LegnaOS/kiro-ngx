@@ -125,6 +125,69 @@ class AddCredentialRequest:
         )
 
 
+@dataclass
+class BatchImportRequest:
+    credentials: list[AddCredentialRequest] = field(default_factory=list)
+    skip_verify: bool = True
+    regions: list[str] = field(default_factory=lambda: ["eu-north-1", "us-east-1"])
+
+
+@dataclass
+class BatchImportItemResult:
+    index: int
+    status: str
+    message: str = ""
+    email: Optional[str] = None
+    credential_id: Optional[int] = None
+    usage: Optional[str] = None
+    rollback_status: Optional[str] = None
+    rollback_error: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        data = {
+            "index": self.index,
+            "status": self.status,
+            "message": self.message,
+        }
+        if self.email is not None:
+            data["email"] = self.email
+        if self.credential_id is not None:
+            data["credentialId"] = self.credential_id
+        if self.usage is not None:
+            data["usage"] = self.usage
+        if self.rollback_status is not None:
+            data["rollbackStatus"] = self.rollback_status
+        if self.rollback_error is not None:
+            data["rollbackError"] = self.rollback_error
+        return data
+
+
+@dataclass
+class BatchImportResponse:
+    success: bool = True
+    total: int = 0
+    success_count: int = 0
+    duplicate_count: int = 0
+    fail_count: int = 0
+    rollback_success_count: int = 0
+    rollback_failed_count: int = 0
+    rollback_skipped_count: int = 0
+    results: list[BatchImportItemResult] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "success": self.success,
+            "total": self.total,
+            "successCount": self.success_count,
+            "duplicateCount": self.duplicate_count,
+            "failCount": self.fail_count,
+            "rollbackSuccessCount": self.rollback_success_count,
+            "rollbackFailedCount": self.rollback_failed_count,
+            "rollbackSkippedCount": self.rollback_skipped_count,
+            "results": [item.to_dict() for item in self.results],
+        }
+
+
 # ============ 余额查询 ============
 
 @dataclass

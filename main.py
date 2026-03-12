@@ -18,12 +18,16 @@ from kiro.token_manager import MultiTokenManager
 from kiro.provider import KiroProvider
 from anthropic_api.router import create_router_with_provider
 from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middleware
-from admin import AdminService, AdminAuthMiddleware, create_admin_router
+from admin import (
+    AdminService, AdminAuthMiddleware, RemoteAuthMiddleware,
+    create_admin_router, create_remote_router,
+)
 from admin.ui_router import create_admin_ui_router
 from admin.runtime_log import init_runtime_log_buffer
 from plugin_loader import load_plugins, get_loaded_plugins
 from anthropic_api.message_log import init_message_logger
 from token_usage import init_token_usage_tracker
+from common.auth import sha256_hex
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -138,6 +142,12 @@ def main():
         admin_app.add_middleware(AdminAuthMiddleware, admin_api_key=admin_key)
         app.mount("/api/admin", admin_app)
 
+        remote_app = FastAPI()
+        remote_app.include_router(create_remote_router())
+        remote_app.state.admin_service = admin_service
+        remote_app.add_middleware(RemoteAuthMiddleware, remote_api_token=sha256_hex(admin_key))
+        app.mount("/api/remote", remote_app)
+
         # Admin UI
         admin_ui_router = create_admin_ui_router()
         admin_ui_app = FastAPI()
@@ -145,6 +155,7 @@ def main():
         app.mount("/admin", admin_ui_app)
 
         logger.info("Admin API 已启用")
+        logger.info("Remote API 已启用")
         logger.info("Admin UI 已启用: /admin")
     elif admin_key is not None:
         logger.warning("admin_api_key 配置为空，Admin API 未启用")
@@ -165,6 +176,9 @@ def main():
         logger.info("  POST /api/admin/credentials/:index/priority")
         logger.info("  POST /api/admin/credentials/:index/reset")
         logger.info("  GET  /api/admin/credentials/:index/balance")
+        logger.info("Remote API:")
+        logger.info("  GET  /api/remote/credentials/available")
+        logger.info("  POST /api/remote/credentials/batch-import")
         logger.info("Admin UI:")
         logger.info("  GET  /admin")
 

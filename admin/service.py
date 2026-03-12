@@ -9,12 +9,14 @@ from typing import Optional
 
 from admin.types import (
     AddCredentialRequest, AddCredentialResponse, BalanceResponse,
+    BatchImportItemResult, BatchImportRequest, BatchImportResponse,
     CredentialStatusItem, CredentialsStatusResponse,
 )
 from admin.error import (
     AdminServiceError, NotFoundError, UpstreamError,
     InternalError, InvalidCredentialError,
 )
+from common.auth import sha256_hex
 from kiro.model.credentials import KiroCredentials
 
 logger = logging.getLogger(__name__)
@@ -217,6 +219,176 @@ class AdminService:
             email=email,
         )
 
+    def get_available_credential_counts(self) -> dict:
+        """获取总凭据数和可用凭据数。"""
+        snapshot = self.token_manager.snapshot()
+        return {
+            "total": snapshot.total,
+            "available": snapshot.available,
+        }
+
+    async def batch_import_credentials(self, req: BatchImportRequest) -> BatchImportResponse:
+        """服务端批量导入，行为对齐前端“批量导入”手动操作。"""
+        snapshot = self.token_manager.snapshot()
+        existing_hashes = {
+            entry.refresh_token_hash
+            for entry in snapshot.entries
+            if entry.refresh_token_hash
+        }
+        fallback_regions = [r for r in req.regions if isinstance(r, str) and r.strip()]
+        results: list[BatchImportItemResult] = []
+
+        success_count = 0
+        duplicate_count = 0
+        fail_count = 0
+        rollback_success_count = 0
+        rollback_failed_count = 0
+        rollback_skipped_count = 0
+
+        for idx, cred in enumerate(req.credentials, start=1):
+            refresh_token = cred.refresh_token.strip()
+            token_hash = sha256_hex(refresh_token) if refresh_token else ""
+
+            if not refresh_token:
+                fail_count += 1
+                results.append(BatchImportItemResult(
+                    index=idx,
+                    status="failed",
+                    message="refreshToken 为空",
+                    rollback_status="skipped",
+                ))
+                rollback_skipped_count += 1
+                continue
+
+            if token_hash in existing_hashes:
+                duplicate_count += 1
+                results.append(BatchImportItemResult(
+                    index=idx,
+                    status="duplicate",
+                    message="该凭据已存在",
+                ))
+                continue
+
+            client_id = cred.client_id.strip() if isinstance(cred.client_id, str) else cred.client_id
+            client_secret = cred.client_secret.strip() if isinstance(cred.client_secret, str) else cred.client_secret
+            if (client_id and not client_secret) or (client_secret and not client_id):
+                fail_count += 1
+                rollback_skipped_count += 1
+                results.append(BatchImportItemResult(
+                    index=idx,
+                    status="failed",
+                    message="idc 模式需要同时提供 clientId 和 clientSecret",
+                    rollback_status="skipped",
+                ))
+                continue
+
+            auth_method = "idc" if client_id and client_secret else "social"
+            specified_region = (cred.auth_region or cred.region or "").strip() if (cred.auth_region or cred.region) else ""
+            regions_to_try = []
+            if specified_region:
+                regions_to_try.append(specified_region)
+            regions_to_try.extend([r for r in fallback_regions if r != specified_region])
+            if not regions_to_try:
+                regions_to_try = ["eu-north-1", "us-east-1"]
+
+            added_credential = None
+            added_credential_id = None
+            last_error = None
+
+            for region in regions_to_try:
+                try:
+                    add_req = AddCredentialRequest(
+                        refresh_token=refresh_token,
+                        auth_method=auth_method,
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        priority=cred.priority,
+                        region=cred.region,
+                        auth_region=region,
+                        api_region=cred.api_region,
+                        machine_id=cred.machine_id,
+                        email=cred.email,
+                        proxy_url=cred.proxy_url,
+                        proxy_username=cred.proxy_username,
+                        proxy_password=cred.proxy_password,
+                    )
+                    added_credential = await self.add_credential(add_req)
+                    added_credential_id = added_credential.credential_id
+                    break
+                except Exception as e:
+                    last_error = e
+
+            if added_credential is None or added_credential_id is None:
+                fail_count += 1
+                rollback_skipped_count += 1
+                message = str(last_error) if last_error else "所有区域均失败"
+                results.append(BatchImportItemResult(
+                    index=idx,
+                    status="failed",
+                    message=message,
+                    rollback_status="skipped",
+                ))
+                continue
+
+            if req.skip_verify:
+                success_count += 1
+                existing_hashes.add(token_hash)
+                results.append(BatchImportItemResult(
+                    index=idx,
+                    status="verified",
+                    message="导入成功",
+                    email=added_credential.email,
+                    credential_id=added_credential_id,
+                ))
+                continue
+
+            try:
+                balance = await self.get_balance(added_credential_id)
+                success_count += 1
+                existing_hashes.add(token_hash)
+                results.append(BatchImportItemResult(
+                    index=idx,
+                    status="verified",
+                    message="导入并验活成功",
+                    email=added_credential.email,
+                    credential_id=added_credential_id,
+                    usage=f"{balance.current_usage}/{balance.usage_limit}",
+                ))
+            except Exception as e:
+                fail_count += 1
+                rollback_status = "skipped"
+                rollback_error = None
+                if added_credential_id is not None:
+                    rollback_status, rollback_error = self._rollback_credential(added_credential_id)
+                    if rollback_status == "success":
+                        rollback_success_count += 1
+                    elif rollback_status == "failed":
+                        rollback_failed_count += 1
+                    else:
+                        rollback_skipped_count += 1
+                else:
+                    rollback_skipped_count += 1
+                results.append(BatchImportItemResult(
+                    index=idx,
+                    status="failed",
+                    message=str(e),
+                    credential_id=added_credential_id,
+                    rollback_status=rollback_status,
+                    rollback_error=rollback_error,
+                ))
+
+        return BatchImportResponse(
+            success=True,
+            total=len(req.credentials),
+            success_count=success_count,
+            duplicate_count=duplicate_count,
+            fail_count=fail_count,
+            rollback_success_count=rollback_success_count,
+            rollback_failed_count=rollback_failed_count,
+            rollback_skipped_count=rollback_skipped_count,
+            results=results,
+        )
+
     def delete_credential(self, id: int) -> None:
         """删除凭据"""
         try:
@@ -226,6 +398,19 @@ class AdminService:
         with self._cache_lock:
             self._balance_cache.pop(id, None)
         self._save_balance_cache()
+
+    def _rollback_credential(self, cid: int) -> tuple[str, Optional[str]]:
+        """回滚失败导入的凭据：先禁用，再删除。"""
+        try:
+            self.set_disabled(cid, True)
+        except AdminServiceError as e:
+            return "failed", f"禁用失败: {e}"
+
+        try:
+            self.delete_credential(cid)
+            return "success", None
+        except AdminServiceError as e:
+            return "failed", f"删除失败: {e}"
 
     def set_credential_group(self, cid: int, group: str) -> None:
         """设置凭据分组"""
