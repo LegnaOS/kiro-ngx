@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 PING_INTERVAL_SECS = 25
 MAX_STREAM_IDLE_PINGS = 8
+LOCAL_CONTEXT_TOKEN_LIMIT = int(CONTEXT_WINDOW_SIZE * 0.92)
+LOCAL_REQUEST_MAX_BYTES = 8 * 1024 * 1024
+LOCAL_REQUEST_MAX_CHARS = 2_000_000
+
+
+class LocalRequestLimitError(RuntimeError):
+    def __init__(self, message: str, *, error_type: str = "invalid_request_error"):
+        super().__init__(message)
+        self.error_type = error_type
 
 
 async def _aclose_response_quietly(response) -> None:
@@ -73,21 +82,49 @@ async def _iter_stream_chunks_with_ping(
 def _map_provider_error(err: Exception):
     err_str = str(err)
     if "CONTENT_LENGTH_EXCEEDS_THRESHOLD" in err_str:
-        logger.warning("上游拒绝请求：上下文窗口已满")
+        logger.warning("上游拒绝请求：请求体超过上游内容阈值")
         return JSONResponse(status_code=400, content=ErrorResponse.new(
             "invalid_request_error",
-            "Context window is full. Reduce conversation history, system prompt, or tools.",
+            "Request payload is too large for the upstream Kiro API. Reduce large tool results, history, images, or tools.",
         ).to_dict())
     if "Input is too long" in err_str:
-        logger.warning("上游拒绝请求：输入过长")
+        logger.warning("上游拒绝请求：上下文输入过长")
         return JSONResponse(status_code=400, content=ErrorResponse.new(
             "invalid_request_error",
-            "Input is too long. Reduce the size of your messages.",
+            "Conversation context is too long. Reduce message history, system prompt, or tool definitions.",
         ).to_dict())
     logger.error("Kiro API 调用失败: %s", err)
     return JSONResponse(status_code=502, content=ErrorResponse.new(
         "api_error", f"上游 API 调用失败: {err}",
     ).to_dict())
+
+
+def _validate_outbound_kiro_request(kiro_request: Dict[str, Any], request_body: str) -> token_module.PayloadMetrics:
+    body_chars = len(request_body)
+    body_bytes = len(request_body.encode("utf-8"))
+    metrics = token_module.estimate_kiro_payload_metrics(kiro_request)
+
+    if body_bytes > LOCAL_REQUEST_MAX_BYTES:
+        raise LocalRequestLimitError(
+            "Request payload is too large before sending. Reduce large tool results, history, images, or tools.",
+        )
+    if body_chars > LOCAL_REQUEST_MAX_CHARS:
+        raise LocalRequestLimitError(
+            "Request payload text is too large before sending. Reduce large tool results, history, or system prompt.",
+        )
+    if metrics.tokens > LOCAL_CONTEXT_TOKEN_LIMIT:
+        raise LocalRequestLimitError(
+            "Estimated conversation context is too large before sending. Reduce message history, system prompt, or tool definitions.",
+        )
+    return metrics
+
+
+def _local_limit_error_response(err: LocalRequestLimitError) -> JSONResponse:
+    logger.warning("本地请求预检拒绝发送: %s", err)
+    return JSONResponse(
+        status_code=400,
+        content=ErrorResponse.new(err.error_type, str(err)).to_dict(),
+    )
 
 
 def _report_token_usage(model: str, input_tokens: int, output_tokens: int):
@@ -437,6 +474,7 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
         logger.info("检测到纯 WebSearch 请求，路由到 WebSearch 处理")
         input_tokens = token_module.count_all_tokens(
             payload.model, payload.system, payload.messages, payload.tools,
+            payload.thinking, payload.output_config,
         )
         return await websearch.handle_websearch_request(provider, payload, input_tokens)
 
@@ -461,7 +499,13 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
 
     input_tokens = token_module.count_all_tokens(
         payload.model, payload.system, payload.messages, payload.tools,
+        payload.thinking, payload.output_config,
     )
+    try:
+        outbound_metrics = _validate_outbound_kiro_request(kiro_request, request_body)
+    except LocalRequestLimitError as e:
+        return _local_limit_error_response(e)
+    input_tokens = max(input_tokens, outbound_metrics.tokens)
     thinking = payload.get_thinking()
     thinking_enabled = thinking.is_enabled() if thinking else False
 
@@ -714,6 +758,15 @@ async def _handle_stream_auto_continue(
                     model=model, messages=continuation_messages,
                     system=payload.system, tools=payload.tools, stream=True,
                 )
+
+            try:
+                continuation_metrics = _validate_outbound_kiro_request(cont_kiro_req, cont_body)
+                input_tokens = max(input_tokens, continuation_metrics.tokens)
+            except LocalRequestLimitError as e:
+                logger.warning("auto-continue 第 %d 轮本地预检拒绝发送: %s", round_idx + 1, e)
+                yield _make_final_delta_sse(input_tokens, ctx.output_tokens, "end_turn").to_sse_string()
+                yield SseEvent("message_stop", {"type": "message_stop"}).to_sse_string()
+                return
 
             try:
                 current_response = await provider.call_api_stream(cont_body)

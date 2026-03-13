@@ -1,5 +1,6 @@
 """Anthropic -> Kiro 协议转换器 - 参考 src/anthropic/converter.rs"""
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -39,6 +40,16 @@ SYSTEM_CHUNKED_POLICY = (
     "Never ask the user whether to switch approaches. "
     "Complete all chunked operations without commentary."
 )
+
+MAX_TOOL_DESCRIPTION_LENGTH = 9216
+RECENT_HISTORY_WINDOW = 5
+CURRENT_TOOL_RESULT_MAX_CHARS = 16_000
+CURRENT_TOOL_RESULT_MAX_LINES = 300
+HISTORY_TOOL_RESULT_MAX_CHARS = 6_000
+HISTORY_TOOL_RESULT_MAX_LINES = 120
+CURRENT_MESSAGE_PLACEHOLDER = "Tool results provided."
+CONTINUE_PLACEHOLDER = "Continue"
+EMPTY_ASSISTANT_PLACEHOLDER = "OK"
 
 
 class ConversionError(Exception):
@@ -130,22 +141,128 @@ def _get_image_format(media_type: str) -> Optional[str]:
 
 
 def _extract_tool_result_content(content: Any) -> str:
+    return _extract_text_content(content)
+
+
+def _extract_text_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [item.get("text", "") for item in content if isinstance(item, dict) and "text" in item]
-        return "\n".join(parts)
+        parts = [_extract_text_content(item) for item in content]
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        block_type = content.get("type", "")
+        if block_type == "text":
+            text = content.get("text")
+            return text if isinstance(text, str) else ""
+        if block_type == "thinking":
+            thinking = content.get("thinking")
+            if isinstance(thinking, str):
+                return thinking
+            text = content.get("text")
+            return text if isinstance(text, str) else ""
+        if block_type == "tool_result":
+            return _extract_text_content(content.get("content"))
+        if block_type == "tool_use":
+            inp = content.get("input")
+            if inp is None:
+                return ""
+            try:
+                return json.dumps(inp, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                return str(inp)
+        if "text" in content and isinstance(content.get("text"), str):
+            return content.get("text", "")
+        if "content" in content:
+            return _extract_text_content(content.get("content"))
+        try:
+            return json.dumps(content, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            return str(content)
     if content is not None:
         return str(content)
     return ""
+
+
+def _truncate_middle(text: str, max_chars: int, max_lines: int, label: str) -> str:
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized:
+        return ""
+
+    lines = normalized.split("\n")
+    line_count = len(lines)
+    if len(normalized) <= max_chars and line_count <= max_lines:
+        return normalized
+
+    head_lines = max(1, max_lines // 2)
+    tail_lines = max(1, max_lines - head_lines)
+    head = "\n".join(lines[:head_lines])
+    tail = "\n".join(lines[-tail_lines:]) if tail_lines < line_count else ""
+    omitted_lines = max(line_count - head_lines - tail_lines, 0)
+    omitted_chars = max(len(normalized) - len(head) - len(tail), 0)
+    summary = (
+        f"[{label} truncated: original {len(normalized)} chars / {line_count} lines; "
+        f"omitted middle {omitted_chars} chars / {omitted_lines} lines]"
+    )
+
+    combined_parts = [head, summary]
+    if tail:
+        combined_parts.append(tail)
+    truncated = "\n".join(part for part in combined_parts if part)
+
+    if len(truncated) <= max_chars:
+        return truncated
+
+    budget = max(max_chars - len(summary) - 2, 0)
+    if budget <= 0:
+        return summary[:max_chars]
+    head_budget = max(1, budget // 2)
+    tail_budget = max(1, budget - head_budget)
+    head_text = normalized[:head_budget].rstrip()
+    tail_text = normalized[-tail_budget:].lstrip() if tail_budget < len(normalized) else ""
+    parts = [head_text, summary]
+    if tail_text:
+        parts.append(tail_text)
+    return "\n".join(part for part in parts if part)
+
+
+def _shrink_tool_result_content(content: Any, history_distance: Optional[int] = None) -> str:
+    raw = _extract_tool_result_content(content)
+    if history_distance is None:
+        max_chars = CURRENT_TOOL_RESULT_MAX_CHARS
+        max_lines = CURRENT_TOOL_RESULT_MAX_LINES
+        label = "tool_result"
+    else:
+        recent = history_distance <= RECENT_HISTORY_WINDOW
+        max_chars = CURRENT_TOOL_RESULT_MAX_CHARS if recent else HISTORY_TOOL_RESULT_MAX_CHARS
+        max_lines = CURRENT_TOOL_RESULT_MAX_LINES if recent else HISTORY_TOOL_RESULT_MAX_LINES
+        label = f"history tool_result#{history_distance}"
+    return _truncate_middle(raw, max_chars=max_chars, max_lines=max_lines, label=label)
+
+
+def _dedupe_tool_results(tool_results: List[ToolResult]) -> List[ToolResult]:
+    seen: Set[str] = set()
+    deduped: List[ToolResult] = []
+    for result in tool_results:
+        if not result.tool_use_id or result.tool_use_id in seen:
+            continue
+        seen.add(result.tool_use_id)
+        deduped.append(result)
+    return deduped
 # PLACEHOLDER_CONVERTER_PART2
 
 
-def _process_message_content(content: Any) -> Tuple[str, List[KiroImage], List[ToolResult]]:
+def _process_message_content(
+    content: Any,
+    keep_images: bool = True,
+    image_placeholder: bool = False,
+    history_distance: Optional[int] = None,
+) -> Tuple[str, List[KiroImage], List[ToolResult]]:
     """处理消息内容，提取文本、图片和工具结果"""
     text_parts: List[str] = []
     images: List[KiroImage] = []
     tool_results: List[ToolResult] = []
+    omitted_images = 0
 
     if isinstance(content, str):
         text_parts.append(content)
@@ -159,20 +276,29 @@ def _process_message_content(content: Any) -> Tuple[str, List[KiroImage], List[T
                 if t:
                     text_parts.append(t)
             elif block_type == "image":
-                source = item.get("source", {})
-                fmt = _get_image_format(source.get("media_type", ""))
-                if fmt:
-                    images.append(KiroImage.from_base64(fmt, source.get("data", "")))
+                if keep_images:
+                    source = item.get("source", {})
+                    fmt = _get_image_format(source.get("media_type", ""))
+                    if fmt:
+                        images.append(KiroImage.from_base64(fmt, source.get("data", "")))
+                else:
+                    omitted_images += 1
             elif block_type == "tool_result":
                 tool_use_id = item.get("tool_use_id")
                 if tool_use_id:
-                    result_content = _extract_tool_result_content(item.get("content"))
+                    result_content = _shrink_tool_result_content(
+                        item.get("content"),
+                        history_distance=history_distance,
+                    )
                     is_error = item.get("is_error", False)
                     tr = ToolResult.error(tool_use_id, result_content) if is_error else ToolResult.success(tool_use_id, result_content)
                     tr.status = "error" if is_error else "success"
                     tool_results.append(tr)
 
-    return "\n".join(text_parts), images, tool_results
+    if omitted_images and image_placeholder:
+        text_parts.append(f"[此历史消息包含 {omitted_images} 张图片，已省略原始内容]")
+
+    return "\n".join(part for part in text_parts if part), images, _dedupe_tool_results(tool_results)
 
 
 def _make_web_search_tool() -> Tool:
@@ -195,20 +321,28 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
     """转换工具定义，仅在客户端发送 web_search 时转换"""
     result = []
     has_web_search = False
+    saw_real_tool = False
     for t in (tools or []):
         tool_type = t.get("type", "")
         if tool_type and tool_type.startswith("web_search"):
             if not has_web_search:
                 result.append(_make_web_search_tool())
                 has_web_search = True
+                saw_real_tool = True
             continue
         name = t.get("name", "")
+        if not name:
+            continue
         if name == "web_search":
             if not has_web_search:
                 result.append(_make_web_search_tool())
                 has_web_search = True
+                saw_real_tool = True
             continue
         desc = t.get("description", "")
+        if not isinstance(desc, str) or not desc.strip():
+            logger.info("跳过 description 为空的工具: %s", name)
+            continue
         suffix = ""
         if name == "Write":
             suffix = WRITE_TOOL_DESCRIPTION_SUFFIX
@@ -216,8 +350,8 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
             suffix = EDIT_TOOL_DESCRIPTION_SUFFIX
         if suffix:
             desc = f"{desc}\n{suffix}"
-        if len(desc) > 10000:
-            desc = desc[:10000]
+        if len(desc) > MAX_TOOL_DESCRIPTION_LENGTH:
+            desc = desc[:MAX_TOOL_DESCRIPTION_LENGTH] + "..."
         schema = normalize_json_schema(t.get("input_schema", {}))
         result.append(Tool(
             tool_specification=ToolSpecification(
@@ -225,6 +359,13 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
                 input_schema=InputSchema.from_json(schema),
             )
         ))
+        saw_real_tool = True
+
+    if result or not tools:
+        return result
+    if not saw_real_tool:
+        logger.info("所有工具均被降载过滤，插入占位工具")
+        return [_create_placeholder_tool("no_tool_available")]
     return result
 
 
@@ -344,7 +485,7 @@ def _merge_user_messages(messages: List[AnthropicMessage], model_id: str) -> His
         user_msg.images = all_images
     if all_tool_results:
         user_msg.user_input_message_context = UserInputMessageContext(
-            tool_results=all_tool_results,
+            tool_results=_dedupe_tool_results(all_tool_results),
         )
     return HistoryUserMessage(user_input_message=user_msg)
 
@@ -445,21 +586,45 @@ def _build_history(
 
     # 2. 处理常规消息历史（最后一条作为 currentMessage，不加入历史）
     history_end = len(messages) - 1
-    user_buffer: List[AnthropicMessage] = []
+    user_buffer: List[Tuple[AnthropicMessage, int]] = []
     assistant_buffer: List[AnthropicMessage] = []
 
     for i in range(history_end):
         msg = messages[i]
+        history_distance = history_end - i
         if msg.role == "user":
             # 先 flush assistant buffer
             if assistant_buffer:
                 history.append(Message(_merge_assistant_messages(assistant_buffer)))
                 assistant_buffer = []
-            user_buffer.append(msg)
+            user_buffer.append((msg, history_distance))
         elif msg.role == "assistant":
             # 先 flush user buffer
             if user_buffer:
-                history.append(Message(_merge_user_messages(user_buffer, model_id)))
+                texts: List[str] = []
+                images: List[KiroImage] = []
+                tool_results: List[ToolResult] = []
+                for user_msg, distance in user_buffer:
+                    keep_images = distance <= RECENT_HISTORY_WINDOW
+                    text, imgs, results = _process_message_content(
+                        user_msg.content,
+                        keep_images=keep_images,
+                        image_placeholder=not keep_images,
+                        history_distance=distance,
+                    )
+                    if text:
+                        texts.append(text)
+                    images.extend(imgs)
+                    tool_results.extend(results)
+                merged_content = "\n".join(part for part in texts if part)
+                merged = UserMessage.new(merged_content, model_id)
+                if images:
+                    merged.images = images
+                if tool_results:
+                    merged.user_input_message_context = UserInputMessageContext(
+                        tool_results=_dedupe_tool_results(tool_results),
+                    )
+                history.append(Message(HistoryUserMessage(user_input_message=merged)))
                 user_buffer = []
             assistant_buffer.append(msg)
 
@@ -469,9 +634,32 @@ def _build_history(
 
     # flush 末尾孤立 user buffer → 自动配对 "OK"
     if user_buffer:
-        history.append(Message(_merge_user_messages(user_buffer, model_id)))
+        texts: List[str] = []
+        images: List[KiroImage] = []
+        tool_results: List[ToolResult] = []
+        for user_msg, distance in user_buffer:
+            keep_images = distance <= RECENT_HISTORY_WINDOW
+            text, imgs, results = _process_message_content(
+                user_msg.content,
+                keep_images=keep_images,
+                image_placeholder=not keep_images,
+                history_distance=distance,
+            )
+            if text:
+                texts.append(text)
+            images.extend(imgs)
+            tool_results.extend(results)
+        merged_content = "\n".join(part for part in texts if part)
+        merged = UserMessage.new(merged_content, model_id)
+        if images:
+            merged.images = images
+        if tool_results:
+            merged.user_input_message_context = UserInputMessageContext(
+                tool_results=_dedupe_tool_results(tool_results),
+            )
+        history.append(Message(HistoryUserMessage(user_input_message=merged)))
         history.append(Message(HistoryAssistantMessage(
-            assistant_response_message=AssistantMessage.new("OK"),
+            assistant_response_message=AssistantMessage.new(EMPTY_ASSISTANT_PLACEHOLDER),
         )))
 
     return history
@@ -487,17 +675,9 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
     if not messages:
         raise EmptyMessagesError()
 
-    # prefill 预处理：末尾是 assistant 则截断到最后一条 user
-    if messages[-1].role != "user":
-        logger.info("检测到末尾 assistant 消息（prefill），静默丢弃")
-        last_user_idx = None
-        for idx in range(len(messages) - 1, -1, -1):
-            if messages[idx].role == "user":
-                last_user_idx = idx
-                break
-        if last_user_idx is None:
-            raise EmptyMessagesError()
-        messages = messages[:last_user_idx + 1]
+    last_message_is_assistant = messages[-1].role == "assistant"
+    if last_message_is_assistant:
+        logger.info("检测到末尾 assistant 消息，将其移入 history，并构造 Continue 当前消息")
 # PLACEHOLDER_CONVERTER_PART8
 
     # 提取 session_id
@@ -507,15 +687,36 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
         session_id = _extract_session_id(meta.user_id)
     conversation_id = session_id or str(uuid.uuid4())
 
-    # 处理最后一条消息作为 current_message
-    last_msg = messages[-1]
-    current_text, current_images, current_tool_results = _process_message_content(last_msg.content)
-
     # 转换工具定义
     tools = _convert_tools(req.tools)
 
     # 构建历史消息（system prompt 在此注入为首对 user+assistant）
     history = _build_history(req, messages, model_id)
+
+    if last_message_is_assistant:
+        history.append(Message(_convert_assistant_message(messages[-1])))
+
+    if last_message_is_assistant and (not history or not history[-1].is_assistant()):
+        history.append(Message(HistoryAssistantMessage(
+            assistant_response_message=AssistantMessage.new(CONTINUE_PLACEHOLDER),
+        )))
+
+    # 处理最后一条消息作为 current_message
+    current_images: List[KiroImage] = []
+    current_tool_results: List[ToolResult] = []
+    current_text = ""
+    if last_message_is_assistant:
+        current_text = CONTINUE_PLACEHOLDER
+    else:
+        last_msg = messages[-1]
+        current_text, current_images, current_tool_results = _process_message_content(
+            last_msg.content,
+            keep_images=True,
+            image_placeholder=False,
+            history_distance=None,
+        )
+        if not current_text:
+            current_text = CURRENT_MESSAGE_PLACEHOLDER if current_tool_results else CONTINUE_PLACEHOLDER
 
     # 一次遍历：验证 tool pairing + 收集工具名 + 移除孤立 tool_use
     history_tool_names, validated_tool_results = _process_history_tools(history, current_tool_results)
@@ -532,7 +733,7 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
         context.tool_results = validated_tool_results
 
     # 构建当前消息
-    current_msg = UserInputMessage.new(current_text, model_id)
+    current_msg = UserInputMessage.new(current_text or CONTINUE_PLACEHOLDER, model_id)
     current_msg.origin = "AI_EDITOR"
     if current_images:
         current_msg.images = current_images
