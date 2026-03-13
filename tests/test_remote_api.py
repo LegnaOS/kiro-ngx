@@ -1,9 +1,9 @@
 import unittest
 
-from admin.remote_handlers import _parse_batch_import_request
 from admin.service import AdminService
 from admin.types import AddCredentialResponse
 from common.auth import sha256_hex
+from plugins.remote_api.handlers import _parse_batch_import_request
 
 
 class _SnapshotEntry:
@@ -51,7 +51,7 @@ class _BatchImportService(AdminService):
             email=req.email,
         )
 
-    async def get_balance(self, id):
+    async def get_balance(self, id, force_refresh=False):
         if id in self.balance_fail_ids:
             raise RuntimeError("balance failed")
         return type("Balance", (), {"current_usage": 1, "usage_limit": 100})()

@@ -141,14 +141,15 @@ class AdminService:
         """重置所有凭据的均衡点数和计数器"""
         self.token_manager.reset_all_counters()
 
-    async def get_balance(self, id: int) -> BalanceResponse:
+    async def get_balance(self, id: int, force_refresh: bool = False) -> BalanceResponse:
         """获取凭据余额（带缓存）"""
-        with self._cache_lock:
-            cached = self._balance_cache.get(id)
-            if cached:
-                if (time.time() - cached["cached_at"]) < BALANCE_CACHE_TTL_SECS:
-                    logger.debug("凭据 #%d 余额命中缓存", id)
-                    return cached["data"]
+        if not force_refresh:
+            with self._cache_lock:
+                cached = self._balance_cache.get(id)
+                if cached:
+                    if (time.time() - cached["cached_at"]) < BALANCE_CACHE_TTL_SECS:
+                        logger.debug("凭据 #%d 余额命中缓存", id)
+                        return cached["data"]
 
         balance = await self._fetch_balance(id)
 
@@ -159,6 +160,36 @@ class AdminService:
             }
         self._save_balance_cache()
         return balance
+
+    async def get_total_remaining_quota(self, force_refresh: bool = False) -> dict:
+        """汇总当前所有启用凭据的剩余额度。"""
+        snapshot = self.token_manager.snapshot()
+        enabled_ids = [entry.id for entry in snapshot.entries if not entry.disabled]
+
+        total_remaining = 0.0
+        details: list[dict] = []
+        failed: list[dict] = []
+
+        for cid in enabled_ids:
+            try:
+                balance = await self.get_balance(cid, force_refresh=force_refresh)
+                total_remaining += balance.remaining
+                details.append({
+                    "id": cid,
+                    "remaining": balance.remaining,
+                    "subscriptionTitle": balance.subscription_title,
+                })
+            except Exception as e:
+                failed.append({"id": cid, "error": str(e)})
+
+        return {
+            "credentialCount": len(enabled_ids),
+            "succeededCount": len(details),
+            "failedCount": len(failed),
+            "totalRemaining": round(total_remaining, 4),
+            "details": details,
+            "failed": failed,
+        }
 
     async def _fetch_balance(self, id: int) -> BalanceResponse:
         """从上游获取余额"""
