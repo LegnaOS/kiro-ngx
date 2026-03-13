@@ -26,6 +26,13 @@ class Config:
     count_tokens_api_url: Optional[str] = None
     count_tokens_api_key: Optional[str] = None
     count_tokens_auth_type: str = "x-api-key"
+    request_max_bytes: int = 8 * 1024 * 1024
+    request_max_chars: int = 2_000_000
+    request_context_token_limit: int = 184_000
+    tool_result_current_max_chars: int = 16_000
+    tool_result_current_max_lines: int = 300
+    tool_result_history_max_chars: int = 6_000
+    tool_result_history_max_lines: int = 120
     proxy_url: Optional[str] = None
     proxy_username: Optional[str] = None
     proxy_password: Optional[str] = None
@@ -43,6 +50,13 @@ class Config:
         "countTokensApiUrl": "count_tokens_api_url",
         "countTokensApiKey": "count_tokens_api_key",
         "countTokensAuthType": "count_tokens_auth_type",
+        "requestMaxBytes": "request_max_bytes",
+        "requestMaxChars": "request_max_chars",
+        "requestContextTokenLimit": "request_context_token_limit",
+        "toolResultCurrentMaxChars": "tool_result_current_max_chars",
+        "toolResultCurrentMaxLines": "tool_result_current_max_lines",
+        "toolResultHistoryMaxChars": "tool_result_history_max_chars",
+        "toolResultHistoryMaxLines": "tool_result_history_max_lines",
         "proxyUrl": "proxy_url", "proxyUsername": "proxy_username",
         "proxyPassword": "proxy_password", "adminApiKey": "admin_api_key",
         "loadBalancingMode": "load_balancing_mode",

@@ -8,6 +8,13 @@
   "nodeVersion": "22.21.1",
   "tlsBackend": "rustls",
   "countTokensAuthType": "x-api-key",
+  "requestMaxBytes": 8388608,
+  "requestMaxChars": 2000000,
+  "requestContextTokenLimit": 184000,
+  "toolResultCurrentMaxChars": 16000,
+  "toolResultCurrentMaxLines": 300,
+  "toolResultHistoryMaxChars": 6000,
+  "toolResultHistoryMaxLines": 120,
   "adminApiKey": "your-admin-api-key-here",
   "loadBalancingMode": "priority"
 }

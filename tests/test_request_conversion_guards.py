@@ -57,7 +57,7 @@ class TokenCounterCoverageTest(unittest.TestCase):
 
 class ConverterGuardsTest(unittest.TestCase):
     def test_convert_request_truncates_large_tool_result(self):
-        huge_result = "\n".join(f"line {idx} " + ("x" * 120) for idx in range(600))
+        huge_result = "<task-notification>\n" + "\n".join(f"line {idx} " + ("x" * 120) for idx in range(600))
         payload = MessagesRequest(
             model="claude-sonnet-4-6",
             max_tokens=1024,
@@ -80,7 +80,8 @@ class ConverterGuardsTest(unittest.TestCase):
 
         self.assertEqual(len(tool_results), 1)
         tool_text = tool_results[0].content[0]["text"]
-        self.assertIn("tool_result truncated", tool_text)
+        self.assertIn("[summary] contains sub-agent/task transcript output", tool_text)
+        self.assertIn("task transcript truncated", tool_text)
         self.assertLess(len(tool_text), len(huge_result))
 
     def test_convert_request_moves_last_assistant_into_history(self):

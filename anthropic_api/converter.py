@@ -72,6 +72,28 @@ class ConversionResult:
     conversation_state: ConversationState
 
 
+def configure_converter_limits(
+    *,
+    current_tool_result_max_chars: Optional[int] = None,
+    current_tool_result_max_lines: Optional[int] = None,
+    history_tool_result_max_chars: Optional[int] = None,
+    history_tool_result_max_lines: Optional[int] = None,
+) -> None:
+    global CURRENT_TOOL_RESULT_MAX_CHARS
+    global CURRENT_TOOL_RESULT_MAX_LINES
+    global HISTORY_TOOL_RESULT_MAX_CHARS
+    global HISTORY_TOOL_RESULT_MAX_LINES
+
+    if isinstance(current_tool_result_max_chars, int) and current_tool_result_max_chars > 0:
+        CURRENT_TOOL_RESULT_MAX_CHARS = current_tool_result_max_chars
+    if isinstance(current_tool_result_max_lines, int) and current_tool_result_max_lines > 0:
+        CURRENT_TOOL_RESULT_MAX_LINES = current_tool_result_max_lines
+    if isinstance(history_tool_result_max_chars, int) and history_tool_result_max_chars > 0:
+        HISTORY_TOOL_RESULT_MAX_CHARS = history_tool_result_max_chars
+    if isinstance(history_tool_result_max_lines, int) and history_tool_result_max_lines > 0:
+        HISTORY_TOOL_RESULT_MAX_LINES = history_tool_result_max_lines
+
+
 def map_model(model: str) -> Optional[str]:
     """模型映射：Anthropic 模型名 -> Kiro 模型 ID"""
     m = model.lower()
@@ -226,18 +248,40 @@ def _truncate_middle(text: str, max_chars: int, max_lines: int, label: str) -> s
     return "\n".join(part for part in parts if part)
 
 
+def _classify_tool_result_text(text: str) -> Tuple[str, str]:
+    normalized = (text or "").strip()
+    lowered = normalized.lower()
+    if not normalized:
+        return "tool_result", "empty payload"
+    if "<task-notification>" in normalized or "full transcript available at:" in lowered:
+        return "task transcript", "contains sub-agent/task transcript output"
+    if "<tool_use_error>" in normalized or "successfully stopped task:" in lowered:
+        return "task control", "contains task control or tool error result"
+    if "<retrieval_status>" in normalized or "<task_id>" in normalized:
+        return "task status", "contains task status polling output"
+    if "[request interrupted by user]" in lowered:
+        return "interrupted transcript", "contains interrupted transcript fragments"
+    if normalized.startswith("{") and "\"task_id\"" in normalized:
+        return "task json", "contains task operation json payload"
+    return "tool_result", "generic tool result content"
+
+
 def _shrink_tool_result_content(content: Any, history_distance: Optional[int] = None) -> str:
     raw = _extract_tool_result_content(content)
+    kind, detail = _classify_tool_result_text(raw)
     if history_distance is None:
         max_chars = CURRENT_TOOL_RESULT_MAX_CHARS
         max_lines = CURRENT_TOOL_RESULT_MAX_LINES
-        label = "tool_result"
+        label = kind
     else:
         recent = history_distance <= RECENT_HISTORY_WINDOW
         max_chars = CURRENT_TOOL_RESULT_MAX_CHARS if recent else HISTORY_TOOL_RESULT_MAX_CHARS
         max_lines = CURRENT_TOOL_RESULT_MAX_LINES if recent else HISTORY_TOOL_RESULT_MAX_LINES
-        label = f"history tool_result#{history_distance}"
-    return _truncate_middle(raw, max_chars=max_chars, max_lines=max_lines, label=label)
+        label = f"history {kind}#{history_distance}"
+    truncated = _truncate_middle(raw, max_chars=max_chars, max_lines=max_lines, label=label)
+    if truncated == raw:
+        return raw
+    return f"[summary] {detail}\n{truncated}"
 
 
 def _dedupe_tool_results(tool_results: List[ToolResult]) -> List[ToolResult]:

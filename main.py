@@ -18,12 +18,15 @@ from kiro.token_manager import MultiTokenManager
 from kiro.provider import KiroProvider
 from anthropic_api.router import create_router_with_provider
 from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middleware
+from anthropic_api.converter import configure_converter_limits
+from anthropic_api.handlers import configure_request_limits
 from admin import AdminService, AdminAuthMiddleware, create_admin_router
 from admin.ui_router import create_admin_ui_router
 from admin.runtime_log import init_runtime_log_buffer
 from plugin_loader import load_plugins, load_public_plugins, get_loaded_plugins
 from anthropic_api.message_log import init_message_logger
 from token_usage import init_token_usage_tracker
+import token_counter
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -90,6 +93,24 @@ def main():
         sys.exit(1)
 
     kiro_provider = KiroProvider(token_manager=token_manager, proxy=proxy_config)
+
+    token_counter.init_config(token_counter.CountTokensConfig(
+        api_url=config.count_tokens_api_url,
+        api_key=config.count_tokens_api_key,
+        auth_type=config.count_tokens_auth_type,
+        proxy=proxy_config,
+    ))
+    configure_request_limits(
+        max_bytes=config.request_max_bytes,
+        max_chars=config.request_max_chars,
+        context_token_limit=config.request_context_token_limit,
+    )
+    configure_converter_limits(
+        current_tool_result_max_chars=config.tool_result_current_max_chars,
+        current_tool_result_max_lines=config.tool_result_current_max_lines,
+        history_tool_result_max_chars=config.tool_result_history_max_chars,
+        history_tool_result_max_lines=config.tool_result_history_max_lines,
+    )
 
     # 初始化消息日志
     log_dir = Path(__file__).resolve().parent / "logs"

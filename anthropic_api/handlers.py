@@ -38,6 +38,24 @@ class LocalRequestLimitError(RuntimeError):
         self.error_type = error_type
 
 
+def configure_request_limits(
+    *,
+    max_bytes: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    context_token_limit: Optional[int] = None,
+) -> None:
+    global LOCAL_REQUEST_MAX_BYTES
+    global LOCAL_REQUEST_MAX_CHARS
+    global LOCAL_CONTEXT_TOKEN_LIMIT
+
+    if isinstance(max_bytes, int) and max_bytes > 0:
+        LOCAL_REQUEST_MAX_BYTES = max_bytes
+    if isinstance(max_chars, int) and max_chars > 0:
+        LOCAL_REQUEST_MAX_CHARS = max_chars
+    if isinstance(context_token_limit, int) and context_token_limit > 0:
+        LOCAL_CONTEXT_TOKEN_LIMIT = context_token_limit
+
+
 async def _aclose_response_quietly(response) -> None:
     if response is None:
         return
@@ -117,6 +135,47 @@ def _validate_outbound_kiro_request(kiro_request: Dict[str, Any], request_body: 
             "Estimated conversation context is too large before sending. Reduce message history, system prompt, or tool definitions.",
         )
     return metrics
+
+
+def _count_tool_results_in_message(message: Dict[str, Any]) -> int:
+    ctx = message.get("userInputMessageContext", {})
+    tool_results = ctx.get("toolResults", [])
+    return len(tool_results) if isinstance(tool_results, list) else 0
+
+
+def _log_outbound_request_stats(
+    *,
+    source: str,
+    kiro_request: Dict[str, Any],
+    metrics: token_module.PayloadMetrics,
+    anthropic_message_count: int,
+    anthropic_tool_count: int,
+) -> None:
+    conversation_state = kiro_request.get("conversationState", {})
+    history = conversation_state.get("history", [])
+    current = conversation_state.get("currentMessage", {}).get("userInputMessage", {})
+    current_ctx = current.get("userInputMessageContext", {})
+    current_tool_results = current_ctx.get("toolResults", [])
+    current_tools = current_ctx.get("tools", [])
+
+    history_tool_results = 0
+    for item in history:
+        user_message = item.get("userInputMessage", {})
+        history_tool_results += _count_tool_results_in_message(user_message)
+
+    logger.info(
+        "Outbound Kiro request stats: source=%s anthropic_msgs=%d anthropic_tools=%d history=%d current_tool_results=%d history_tool_results=%d current_tools=%d est_tokens=%d chars=%d bytes=%d",
+        source,
+        anthropic_message_count,
+        anthropic_tool_count,
+        len(history),
+        len(current_tool_results) if isinstance(current_tool_results, list) else 0,
+        history_tool_results,
+        len(current_tools) if isinstance(current_tools, list) else 0,
+        metrics.tokens,
+        metrics.chars,
+        metrics.bytes,
+    )
 
 
 def _local_limit_error_response(err: LocalRequestLimitError) -> JSONResponse:
@@ -505,6 +564,13 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
         outbound_metrics = _validate_outbound_kiro_request(kiro_request, request_body)
     except LocalRequestLimitError as e:
         return _local_limit_error_response(e)
+    _log_outbound_request_stats(
+        source="initial",
+        kiro_request=kiro_request,
+        metrics=outbound_metrics,
+        anthropic_message_count=len(payload.messages),
+        anthropic_tool_count=len(payload.tools or []),
+    )
     input_tokens = max(input_tokens, outbound_metrics.tokens)
     thinking = payload.get_thinking()
     thinking_enabled = thinking.is_enabled() if thinking else False
@@ -761,6 +827,13 @@ async def _handle_stream_auto_continue(
 
             try:
                 continuation_metrics = _validate_outbound_kiro_request(cont_kiro_req, cont_body)
+                _log_outbound_request_stats(
+                    source=f"auto_continue_{round_idx + 1}",
+                    kiro_request=cont_kiro_req,
+                    metrics=continuation_metrics,
+                    anthropic_message_count=len(continuation_messages),
+                    anthropic_tool_count=len(cont_payload.tools or []),
+                )
                 input_tokens = max(input_tokens, continuation_metrics.tokens)
             except LocalRequestLimitError as e:
                 logger.warning("auto-continue 第 %d 轮本地预检拒绝发送: %s", round_idx + 1, e)
