@@ -19,7 +19,7 @@ from kiro.provider import KiroProvider
 from anthropic_api.router import create_router_with_provider
 from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middleware
 from anthropic_api.converter import configure_converter_limits
-from anthropic_api.handlers import configure_request_limits
+from anthropic_api.handlers import configure_request_limits, configure_stream_limits
 from admin import AdminService, AdminAuthMiddleware, create_admin_router
 from admin.ui_router import create_admin_ui_router
 from admin.runtime_log import init_runtime_log_buffer
@@ -104,6 +104,11 @@ def main():
         max_bytes=config.request_max_bytes,
         max_chars=config.request_max_chars,
         context_token_limit=config.request_context_token_limit,
+    )
+    configure_stream_limits(
+        ping_interval_secs=config.stream_ping_interval_secs,
+        max_idle_pings=config.stream_max_idle_pings,
+        warn_after_idle_pings=config.stream_idle_warn_after_pings,
     )
     configure_converter_limits(
         current_tool_result_max_chars=config.tool_result_current_max_chars,

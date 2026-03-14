@@ -47,7 +47,12 @@ class StreamPingWaitTest(unittest.IsolatedAsyncioTestCase):
         response = _FakeResponse(iterator)
 
         outputs = []
-        async for chunk in _iter_stream_chunks_with_ping(response, ping_interval=0.01):
+        async for chunk in _iter_stream_chunks_with_ping(
+            response,
+            ping_interval=0.01,
+            max_idle_pings=8,
+            warn_after_idle_pings=0,
+        ):
             outputs.append(chunk)
 
         self.assertIn(None, outputs)
@@ -64,6 +69,22 @@ class StreamPingWaitTest(unittest.IsolatedAsyncioTestCase):
                 max_idle_pings=2,
             ):
                 pass
+
+    async def test_idle_ping_logs_warning_before_timeout(self):
+        response = _FakeResponse(_NeverChunkIter())
+
+        with self.assertLogs("anthropic_api.handlers", level="WARNING") as logs:
+            with self.assertRaises(TimeoutError):
+                async for _ in _iter_stream_chunks_with_ping(
+                    response,
+                    ping_interval=0.01,
+                    max_idle_pings=3,
+                    warn_after_idle_pings=2,
+                ):
+                    pass
+
+        output = "\n".join(logs.output)
+        self.assertIn("上游流空闲中", output)
 
 
 if __name__ == "__main__":

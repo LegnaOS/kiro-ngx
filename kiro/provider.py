@@ -177,6 +177,30 @@ class KiroProvider:
             return True
         return False
 
+    @staticmethod
+    def extract_error_reason(body: str) -> Optional[str]:
+        try:
+            value = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if isinstance(value, dict):
+            reason = value.get("reason")
+            if isinstance(reason, str) and reason:
+                return reason
+            error = value.get("error")
+            if isinstance(error, dict):
+                nested_reason = error.get("reason")
+                if isinstance(nested_reason, str) and nested_reason:
+                    return nested_reason
+        return None
+
+    @staticmethod
+    def capacity_backoff_secs(attempt: int) -> int:
+        # 容量不足通常是模型通道拥堵，退避应显著大于普通瞬态错误。
+        base = min(8 + attempt * 3, 24)
+        jitter = random.randint(0, 3)
+        return base + jitter
+
     async def _call_api_with_retry(self, request_body: str, is_stream: bool) -> httpx.Response:
         """带重试逻辑的 API 调用"""
         total_creds = self._token_manager.total_count()
@@ -212,6 +236,7 @@ class KiroProvider:
                     raise RuntimeError(f"{api_type} API 连接池等待超时: {e}")
                 logger.warning("API 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e
+                self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
                 if attempt + 1 < max_retries:
                     await asyncio.sleep(self.retry_delay(attempt))
                 continue
@@ -250,8 +275,21 @@ class KiroProvider:
 
             # 瞬态错误
             if status in (408, 429) or 500 <= status < 600:
+                reason = self.extract_error_reason(body)
+                if status == 429 and reason == "INSUFFICIENT_MODEL_CAPACITY":
+                    cooldown_secs = self.capacity_backoff_secs(attempt)
+                    logger.warning(
+                        "API 请求失败（模型容量不足，尝试 %d/%d）: %d %s; 对凭据 #%d 冷却 %ds",
+                        attempt + 1, max_retries, status, body, ctx.id, cooldown_secs,
+                    )
+                    last_error = RuntimeError(f"{api_type} API 请求失败: {status} {body}")
+                    self._token_manager.report_transient_failure(ctx.id, cooldown_secs=cooldown_secs)
+                    if attempt + 1 < max_retries:
+                        await asyncio.sleep(cooldown_secs)
+                    continue
                 logger.warning("API 请求失败（上游瞬态错误，尝试 %d/%d）: %d %s", attempt + 1, max_retries, status, body)
                 last_error = RuntimeError(f"{api_type} API 请求失败: {status} {body}")
+                self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
                 if attempt + 1 < max_retries:
                     await asyncio.sleep(self.retry_delay(attempt))
                 continue
@@ -296,6 +334,7 @@ class KiroProvider:
                     raise RuntimeError(f"MCP 连接池等待超时: {e}")
                 logger.warning("MCP 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e
+                self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
                 if attempt + 1 < max_retries:
                     await asyncio.sleep(self.retry_delay(attempt))
                 continue
@@ -326,6 +365,7 @@ class KiroProvider:
             if status in (408, 429) or 500 <= status < 600:
                 logger.warning("MCP 请求失败（上游瞬态错误，尝试 %d/%d）: %d %s", attempt + 1, max_retries, status, body)
                 last_error = RuntimeError(f"MCP 请求失败: {status} {body}")
+                self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
                 if attempt + 1 < max_retries:
                     await asyncio.sleep(self.retry_delay(attempt))
                 continue

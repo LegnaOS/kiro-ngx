@@ -29,6 +29,9 @@ class Config:
     request_max_bytes: int = 8 * 1024 * 1024
     request_max_chars: int = 2_000_000
     request_context_token_limit: int = 184_000
+    stream_ping_interval_secs: int = 15
+    stream_max_idle_pings: int = 4
+    stream_idle_warn_after_pings: int = 2
     tool_result_current_max_chars: int = 16_000
     tool_result_current_max_lines: int = 300
     tool_result_history_max_chars: int = 6_000
@@ -53,6 +56,9 @@ class Config:
         "requestMaxBytes": "request_max_bytes",
         "requestMaxChars": "request_max_chars",
         "requestContextTokenLimit": "request_context_token_limit",
+        "streamPingIntervalSecs": "stream_ping_interval_secs",
+        "streamMaxIdlePings": "stream_max_idle_pings",
+        "streamIdleWarnAfterPings": "stream_idle_warn_after_pings",
         "toolResultCurrentMaxChars": "tool_result_current_max_chars",
         "toolResultCurrentMaxLines": "tool_result_current_max_lines",
         "toolResultHistoryMaxChars": "tool_result_history_max_chars",

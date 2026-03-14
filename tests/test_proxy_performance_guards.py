@@ -17,11 +17,14 @@ class _EmptyAsyncIterator:
 
 
 class _FakeStreamResponse:
-    def __init__(self):
+    def __init__(self, items=None):
         self.closed = False
+        self._items = items or []
 
     def aiter_bytes(self):
-        return _EmptyAsyncIterator()
+        if not self._items:
+            return _EmptyAsyncIterator()
+        return _MixedAsyncIterator(self._items)
 
     async def aclose(self):
         self.closed = True
@@ -42,12 +45,36 @@ class _FakeNonStreamResponse:
 class _FakeProvider:
     def __init__(self, response):
         self.response = response
+        self.stream_calls = 0
 
     async def call_api_stream(self, request_body: str):
+        self.stream_calls += 1
+        if isinstance(self.response, list):
+            if not self.response:
+                raise RuntimeError("no more responses")
+            return self.response.pop(0)
         return self.response
 
     async def call_api(self, request_body: str):
         return self.response
+
+
+class _MixedAsyncIterator:
+    def __init__(self, items):
+        self._items = list(items)
+        self._index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self._items):
+            raise StopAsyncIteration
+        item = self._items[self._index]
+        self._index += 1
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 class ProxyPerformanceGuardsTest(unittest.IsolatedAsyncioTestCase):
@@ -65,6 +92,38 @@ class ProxyPerformanceGuardsTest(unittest.IsolatedAsyncioTestCase):
         response = await _handle_non_stream_request(_FakeProvider(upstream), "{}", "claude-sonnet-4-6", 1)
 
         self.assertEqual(response.status_code, 200)
+        self.assertTrue(upstream.closed)
+
+    async def test_stream_handler_retries_once_before_first_event(self):
+        first = _FakeStreamResponse([RuntimeError("boom-before-first-event")])
+        second = _FakeStreamResponse([b'{"content":"hello"}'])
+        provider = _FakeProvider([first, second])
+
+        response = await _handle_stream_request(provider, "{}", "claude-sonnet-4-6", 1, False)
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
+
+        joined = "".join(chunks)
+        self.assertEqual(provider.stream_calls, 2)
+        self.assertIn('event: message_start', joined)
+        self.assertIn('"text": "hello"', joined)
+        self.assertNotIn('event: error', joined)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+
+    async def test_stream_handler_emits_error_instead_of_message_stop_after_partial_output_failure(self):
+        upstream = _FakeStreamResponse([b'{"content":"hello"}', RuntimeError("boom-after-output")])
+        response = await _handle_stream_request(_FakeProvider(upstream), "{}", "claude-sonnet-4-6", 1, False)
+
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
+
+        joined = "".join(chunks)
+        self.assertIn('event: message_start', joined)
+        self.assertIn('event: error', joined)
+        self.assertNotIn('event: message_stop', joined)
         self.assertTrue(upstream.closed)
 
 

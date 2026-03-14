@@ -214,6 +214,7 @@ class StreamContext:
         self.message_id = f"msg_{uuid.uuid4().hex}"
         self.input_tokens = input_tokens
         self.context_input_tokens: Optional[int] = None
+        self.context_total_tokens: Optional[int] = None
         self.output_tokens = 0
         self.tool_block_indices: Dict[str, int] = {}
         self.thinking_enabled = thinking_enabled
@@ -226,6 +227,7 @@ class StreamContext:
         self._accumulated_text_parts: List[str] = []  # 累积文本片段，用于日志记录
         self.web_search_tool_uses: List[Dict[str, Any]] = []  # 记录 web_search tool_use
         self._tool_json_buffers: Dict[str, str] = {}  # tool_use_id → 累积的 JSON 字符串
+        self._last_assistant_content: Optional[str] = None
 
     @property
     def accumulated_text(self) -> str:
@@ -267,8 +269,12 @@ class StreamContext:
         from kiro.model.events.context_usage import ContextUsageEvent
 
         if isinstance(event, AssistantResponseEvent):
+            if event.content and event.content == self._last_assistant_content:
+                return []
+            self._last_assistant_content = event.content
             return self._process_assistant_response(event.content)
         elif isinstance(event, ToolUseEvent):
+            self._last_assistant_content = None
             try:
                 return self._process_tool_use(event)
             except Exception:
@@ -281,13 +287,15 @@ class StreamContext:
                              exc_info=True)
                 return []
         elif isinstance(event, ContextUsageEvent):
+            self._last_assistant_content = None
             actual = int(event.context_usage_percentage * CONTEXT_WINDOW_SIZE / 100.0)
-            self.context_input_tokens = actual
+            self.context_total_tokens = actual
             if event.context_usage_percentage >= 100.0:
                 self.state_manager.set_stop_reason("model_context_window_exceeded")
             return []
         # 处理 dict 格式的事件（异常/错误）
         elif isinstance(event, dict):
+            self._last_assistant_content = None
             etype = event.get("type", "")
             if etype == "exception":
                 if event.get("exception_type") == "ContentLengthExceededException":
@@ -547,9 +555,14 @@ class StreamContext:
                 self.tool_block_indices.pop(tid, None)
             raise IncompleteToolUseError("未完成 tool_use: " + ", ".join(fragments))
 
-        final_input = self.context_input_tokens if self.context_input_tokens is not None else self.input_tokens
+        final_input = self.resolve_input_tokens()
         events.extend(self.state_manager.generate_final_events(final_input, self.output_tokens))
         return events
+
+    def resolve_input_tokens(self) -> int:
+        if self.context_total_tokens is not None:
+            self.context_input_tokens = max(self.context_total_tokens - self.output_tokens, 0)
+        return self.context_input_tokens if self.context_input_tokens is not None else self.input_tokens
 
 
 class BufferedStreamContext:
@@ -581,9 +594,7 @@ class BufferedStreamContext:
 
         self.event_buffer.extend(self.inner.generate_final_events())
 
-        final_input = (self.inner.context_input_tokens
-                       if self.inner.context_input_tokens is not None
-                       else self.estimated_input_tokens)
+        final_input = self.inner.resolve_input_tokens()
 
         # 更正 message_start 中的 input_tokens
         for evt in self.event_buffer:

@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # 每个凭据最大 API 调用失败次数
 MAX_FAILURES_PER_CREDENTIAL = 3
+TRANSIENT_FAILURE_COOLDOWN_SECS = 15
 # 统计数据持久化防抖间隔（秒）
 STATS_SAVE_DEBOUNCE = 30.0
 # IdC Token 刷新所需的 x-amz-user-agent header
@@ -366,6 +367,7 @@ class _CredentialEntry:
     session_count: int = 0  # 本次运行的成功次数，重启归零
     balance_score: int = 0  # 均衡点数（实时计算：per_cred_rpm - time_decay）
     _request_ts: list = None  # 单凭据请求时间戳（用于计算单独 RPM）
+    transient_disabled_until: Optional[float] = None
 
     def __post_init__(self):
         if self._request_ts is None:
@@ -597,13 +599,22 @@ class MultiTokenManager:
                     return True
         return False
 
+    @staticmethod
+    def _is_transiently_unavailable(entry: "_CredentialEntry", now: Optional[float] = None) -> bool:
+        until = entry.transient_disabled_until
+        if until is None:
+            return False
+        current = time.time() if now is None else now
+        return until > current
+
     def _select_next_credential(self, model: Optional[str] = None) -> Optional[tuple[int, KiroCredentials]]:
         """根据动态均衡 + 分组路由选择下一个凭据（需在 _lock 内调用）"""
-        is_opus = model and "opus" in model.lower() if model else False
+        now = time.time()
 
         available = [
             e for e in self._entries
-            if not e.disabled and (not is_opus or e.credentials.supports_opus())
+            if not e.disabled
+            and not self._is_transiently_unavailable(e, now)
         ]
         if not available:
             return None
@@ -634,6 +645,28 @@ class MultiTokenManager:
             e.id
         ))
         return (entry.id, entry.credentials.clone())
+
+    def _build_no_candidate_error(self, model: Optional[str], total: int) -> str:
+        """在没有候选凭据时给出更准确的诊断信息（需在 _lock 内调用）"""
+        enabled_entries = [e for e in self._entries if not e.disabled]
+        enabled_count = len(enabled_entries)
+        cooled_down_entries = [
+            e for e in enabled_entries
+            if self._is_transiently_unavailable(e)
+        ]
+
+        if enabled_count == 0:
+            return f"所有凭据均已禁用（0/{total}）"
+
+        if cooled_down_entries and len(cooled_down_entries) == enabled_count:
+            nearest = min(e.transient_disabled_until or 0 for e in cooled_down_entries)
+            remaining = max(int(nearest - time.time()), 0)
+            return (
+                f"当前暂无可用凭据（启用凭据 {enabled_count}/{total}，"
+                f"所有启用凭据均处于临时冷却中，约 {remaining}s 后重试）"
+            )
+
+        return f"当前模型 {model or '未指定'} 没有可用凭据（启用凭据 {enabled_count}/{total}）"
 
     def _switch_to_next_by_priority(self):
         """切换到下一个优先级最高的可用凭据（排除当前）"""
@@ -673,8 +706,7 @@ class MultiTokenManager:
                     cid, cred = best
                     self._current_id = cid
                 else:
-                    available = sum(1 for e in self._entries if not e.disabled)
-                    raise RuntimeError(f"所有凭据均已禁用（{available}/{total}）")
+                    raise RuntimeError(self._build_no_candidate_error(model, total))
 
             # 尝试获取/刷新 Token
             try:
@@ -733,6 +765,7 @@ class MultiTokenManager:
             for e in self._entries:
                 if e.id == cid:
                     e.failure_count = 0
+                    e.transient_disabled_until = None
                     e.success_count += 1
                     e.session_count += 1
                     e._request_ts.append(now)
@@ -768,6 +801,7 @@ class MultiTokenManager:
                 return any(not e.disabled for e in self._entries)
 
             entry.failure_count += 1
+            entry.transient_disabled_until = None
             entry.last_used_at = _utc_now().isoformat()
             logger.warning("凭据 #%d API 调用失败（%d/%d）", cid, entry.failure_count, MAX_FAILURES_PER_CREDENTIAL)
 
@@ -803,6 +837,7 @@ class MultiTokenManager:
 
             entry.disabled = True
             entry.disabled_reason = _DisabledReason.QUOTA_EXCEEDED
+            entry.transient_disabled_until = None
             entry.last_used_at = _utc_now().isoformat()
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL
             logger.error("凭据 #%d 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", cid)
@@ -816,6 +851,42 @@ class MultiTokenManager:
             else:
                 logger.error("所有凭据均已禁用！")
                 result = False
+        self._save_stats_debounced()
+        return result
+
+    def report_transient_failure(self, cid: int, cooldown_secs: int = TRANSIENT_FAILURE_COOLDOWN_SECS) -> bool:
+        """报告指定凭据遇到瞬态错误，短暂冷却后再参与调度。"""
+        cooldown_secs = max(int(cooldown_secs), 1)
+        with self._lock:
+            entry = None
+            for e in self._entries:
+                if e.id == cid:
+                    entry = e
+                    break
+            if entry is None:
+                return any(not e.disabled and not self._is_transiently_unavailable(e) for e in self._entries)
+            if entry.disabled:
+                return any(not e.disabled and not self._is_transiently_unavailable(e) for e in self._entries)
+
+            entry.last_used_at = _utc_now().isoformat()
+            entry.transient_disabled_until = time.time() + cooldown_secs
+            logger.warning(
+                "凭据 #%d 遇到瞬态错误，进入临时冷却 %ds",
+                cid,
+                cooldown_secs,
+            )
+
+            candidates = [
+                e for e in self._entries
+                if not e.disabled and not self._is_transiently_unavailable(e) and e.id != cid
+            ]
+            if candidates:
+                best = min(candidates, key=lambda e: e.credentials.priority)
+                self._current_id = best.id
+                logger.info("已切换到凭据 #%d（优先级 %d）", best.id, best.credentials.priority)
+                result = True
+            else:
+                result = any(not e.disabled and not self._is_transiently_unavailable(e) for e in self._entries)
         self._save_stats_debounced()
         return result
 

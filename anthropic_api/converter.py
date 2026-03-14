@@ -109,36 +109,70 @@ def map_model(model: str) -> Optional[str]:
 def normalize_json_schema(schema: Any) -> dict:
     """白名单策略：只保留 Kiro API 支持的 JSON Schema 字段，删除可能导致错误的字段"""
     if not isinstance(schema, dict):
-        return {"type": "object", "properties": {}}
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": True,
+        }
 
     # Kiro API 支持的字段白名单（参考 AIClient-2-API 策略）
-    ALLOWED_KEYS = {"type", "description", "properties", "required", "enum", "items", "nullable"}
+    ALLOWED_KEYS = {
+        "type", "description", "properties", "required",
+        "enum", "items", "nullable", "additionalProperties",
+    }
 
     result = {}
     for key, value in schema.items():
         if key not in ALLOWED_KEYS:
             continue  # 删除不支持的字段（$schema, additionalProperties, format, pattern, minimum, maximum 等）
 
-        if key == "properties" and isinstance(value, dict):
-            # 递归处理每个属性的子 schema
-            result[key] = {
-                k: normalize_json_schema(v) if isinstance(v, dict) else v
-                for k, v in value.items()
+        if key == "properties":
+            if isinstance(value, dict):
+                # 递归处理每个属性的子 schema
+                result[key] = {
+                    k: normalize_json_schema(v) if isinstance(v, dict) else v
+                    for k, v in value.items()
+                }
+            else:
+                result[key] = {}
+            continue
+
+        if key == "items":
+            result[key] = normalize_json_schema(value) if isinstance(value, dict) else {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": True,
             }
-        elif key == "items" and isinstance(value, dict):
-            # 递归处理数组元素的子 schema
-            result[key] = normalize_json_schema(value)
-        elif key == "required" and isinstance(value, list):
-            # 确保 required 只包含字符串
-            result[key] = [r for r in value if isinstance(r, str)]
-        else:
-            result[key] = value
+            continue
+
+        if key == "required":
+            # 确保 required 始终是字符串数组
+            result[key] = [r for r in value if isinstance(r, str)] if isinstance(value, list) else []
+            continue
+
+        if key == "additionalProperties":
+            # Kiro 仅接受 bool 或 object，其他情况按 true 处理
+            if isinstance(value, bool):
+                result[key] = value
+            elif isinstance(value, dict):
+                result[key] = normalize_json_schema(value)
+            else:
+                result[key] = True
+            continue
+
+        result[key] = value
 
     # 确保基本字段存在
-    if "type" not in result:
+    if not isinstance(result.get("type"), str) or not result.get("type"):
         result["type"] = "object"
-    if result.get("type") == "object" and "properties" not in result:
+    if result.get("type") == "object" and not isinstance(result.get("properties"), dict):
         result["properties"] = {}
+    if not isinstance(result.get("required"), list):
+        result["required"] = []
+    if "additionalProperties" not in result or not isinstance(result.get("additionalProperties"), (bool, dict)):
+        result["additionalProperties"] = True
 
     return result
 
