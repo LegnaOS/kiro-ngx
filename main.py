@@ -150,6 +150,14 @@ def main():
         admin_service = AdminService(token_manager)
         app.state.admin_service = admin_service
 
+        @app.on_event("startup")
+        async def _start_admin_tasks():
+            admin_service.start_auto_balance_refresh()
+
+        @app.on_event("shutdown")
+        async def _stop_admin_tasks():
+            await admin_service.stop_auto_balance_refresh()
+
         admin_router = create_admin_router()
         admin_app = FastAPI()
         admin_app.include_router(admin_router)

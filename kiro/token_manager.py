@@ -395,6 +395,12 @@ class CredentialEntrySnapshot:
     balance_score: int = 0
     balance_decay: int = 0   # 时间减益分量
     balance_rpm: int = 0     # 单凭据 RPM 分量
+    balance_current_usage: Optional[float] = None
+    balance_usage_limit: Optional[float] = None
+    balance_remaining: Optional[float] = None
+    balance_usage_percentage: Optional[float] = None
+    balance_next_reset_at: Optional[float] = None
+    balance_updated_at: Optional[str] = None
     disabled_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -409,6 +415,12 @@ class CredentialEntrySnapshot:
             "balanceScore": self.balance_score,
             "balanceDecay": self.balance_decay,
             "balanceRpm": self.balance_rpm,
+            "balanceCurrentUsage": self.balance_current_usage,
+            "balanceUsageLimit": self.balance_usage_limit,
+            "balanceRemaining": self.balance_remaining,
+            "balanceUsagePercentage": self.balance_usage_percentage,
+            "balanceNextResetAt": self.balance_next_reset_at,
+            "balanceUpdatedAt": self.balance_updated_at,
         }
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url
@@ -941,6 +953,12 @@ class MultiTokenManager:
                     balance_score=score if not e.disabled else 0,
                     balance_decay=decay if not e.disabled else 0,
                     balance_rpm=cred_rpm if not e.disabled else 0,
+                    balance_current_usage=e.credentials.balance_current_usage,
+                    balance_usage_limit=e.credentials.balance_usage_limit,
+                    balance_remaining=e.credentials.balance_remaining,
+                    balance_usage_percentage=e.credentials.balance_usage_percentage,
+                    balance_next_reset_at=e.credentials.balance_next_reset_at,
+                    balance_updated_at=e.credentials.balance_updated_at,
                     disabled_reason=e.disabled_reason,
                 ))
             return ManagerSnapshot(
@@ -1027,21 +1045,31 @@ class MultiTokenManager:
         effective_proxy = cred.effective_proxy(self._proxy)
         usage = await get_usage_limits(cred, self._config, token, effective_proxy)
 
-        # 更新订阅等级
+        # 更新订阅等级 + 余额快照（持久化到凭据文件）
         sub_title = usage.subscription_title()
-        if sub_title:
-            changed = False
-            with self._lock:
-                entry = self._find_entry(cid)
-                if entry.credentials.subscription_title != sub_title:
-                    entry.credentials.subscription_title = sub_title
-                    logger.info("凭据 #%d 订阅等级已更新: %s", cid, sub_title)
-                    changed = True
-            if changed:
-                try:
-                    self.persist_credentials()
-                except Exception as e:
-                    logger.warning("订阅等级更新后持久化失败: %s", e)
+        current_usage = usage.current_usage_total()
+        usage_limit = usage.usage_limit_total()
+        remaining = max(usage_limit - current_usage, 0.0)
+        usage_percentage = min(current_usage / usage_limit * 100.0, 100.0) if usage_limit > 0 else 0.0
+        changed = False
+        with self._lock:
+            entry = self._find_entry(cid)
+            if sub_title and entry.credentials.subscription_title != sub_title:
+                entry.credentials.subscription_title = sub_title
+                logger.info("凭据 #%d 订阅等级已更新: %s", cid, sub_title)
+                changed = True
+            entry.credentials.balance_current_usage = current_usage
+            entry.credentials.balance_usage_limit = usage_limit
+            entry.credentials.balance_remaining = remaining
+            entry.credentials.balance_usage_percentage = usage_percentage
+            entry.credentials.balance_next_reset_at = usage.next_date_reset
+            entry.credentials.balance_updated_at = _utc_now().isoformat()
+            changed = True
+        if changed:
+            try:
+                self.persist_credentials()
+            except Exception as e:
+                logger.warning("余额快照更新后持久化失败: %s", e)
         return usage
 
     async def add_credential(self, new_cred: KiroCredentials) -> int:

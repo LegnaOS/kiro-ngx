@@ -12,6 +12,7 @@ import type {
   ModelInfo,
   RoutingConfig,
   RuntimeLogResponse,
+  SystemStats,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -70,8 +71,13 @@ export async function resetCredentialFailure(
 }
 
 // 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+export async function getCredentialBalance(
+  id: number,
+  options?: { forceRefresh?: boolean }
+): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`, {
+    params: options?.forceRefresh ? { forceRefresh: 1 } : undefined,
+  })
   return data
 }
 
@@ -114,8 +120,8 @@ export async function saveRawCredentials(content: string): Promise<{ success: bo
 }
 
 // 获取系统资源监控
-export async function getSystemStats(): Promise<{ cpuPercent: number; memoryMb: number }> {
-  const { data } = await api.get<{ cpuPercent: number; memoryMb: number }>('/system/stats')
+export async function getSystemStats(): Promise<SystemStats> {
+  const { data } = await api.get<SystemStats>('/system/stats')
   return data
 }
 

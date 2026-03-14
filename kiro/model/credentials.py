@@ -25,6 +25,12 @@ class KiroCredentials:
     machine_id: Optional[str] = None
     email: Optional[str] = None
     subscription_title: Optional[str] = None
+    balance_current_usage: Optional[float] = None
+    balance_usage_limit: Optional[float] = None
+    balance_remaining: Optional[float] = None
+    balance_usage_percentage: Optional[float] = None
+    balance_next_reset_at: Optional[float] = None
+    balance_updated_at: Optional[str] = None
     proxy_url: Optional[str] = None
     proxy_username: Optional[str] = None
     proxy_password: Optional[str] = None
@@ -39,6 +45,12 @@ class KiroCredentials:
         "region": "region", "authRegion": "auth_region", "apiRegion": "api_region",
         "machineId": "machine_id", "email": "email",
         "subscriptionTitle": "subscription_title",
+        "balanceCurrentUsage": "balance_current_usage",
+        "balanceUsageLimit": "balance_usage_limit",
+        "balanceRemaining": "balance_remaining",
+        "balanceUsagePercentage": "balance_usage_percentage",
+        "balanceNextResetAt": "balance_next_reset_at",
+        "balanceUpdatedAt": "balance_updated_at",
         "proxyUrl": "proxy_url", "proxyUsername": "proxy_username",
         "proxyPassword": "proxy_password", "disabled": "disabled",
     }

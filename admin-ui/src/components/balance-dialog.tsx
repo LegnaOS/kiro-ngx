@@ -12,10 +12,15 @@ interface BalanceDialogProps {
   credentialId: number | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  refreshKey?: number
 }
 
-export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
-  const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+export function BalanceDialog({ credentialId, open, onOpenChange, refreshKey = 0 }: BalanceDialogProps) {
+  const { data: balance, isLoading, error } = useCredentialBalance(credentialId, {
+    forceRefresh: true,
+    enabled: open,
+    refreshKey,
+  })
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'

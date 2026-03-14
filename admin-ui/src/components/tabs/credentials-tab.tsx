@@ -19,6 +19,7 @@ import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 export function CredentialsTab() {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
+  const [balanceDialogRefreshKey, setBalanceDialogRefreshKey] = useState(0)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [credentialsEditorOpen, setCredentialsEditorOpen] = useState(false)
@@ -29,8 +30,9 @@ export function CredentialsTab() {
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
-  const [queryingInfo, setQueryingInfo] = useState(false)
-  const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
+  const [queryingBalance, setQueryingBalance] = useState(false)
+  const [queryBalanceProgress, setQueryBalanceProgress] = useState({ current: 0, total: 0 })
+  const [queryingStatus, setQueryingStatus] = useState(false)
   const cancelVerifyRef = useRef(false)
 
   const { data, refetch } = useCredentials()
@@ -67,6 +69,7 @@ export function CredentialsTab() {
 
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
+    setBalanceDialogRefreshKey(prev => prev + 1)
     setBalanceDialogOpen(true)
   }
 
@@ -117,18 +120,32 @@ export function CredentialsTab() {
     toast[fail === 0 ? 'success' : 'warning'](`清除：成功 ${ok}，失败 ${fail}`)
     deselectAll()
   }
-  // 查询所有凭据信息
-  const handleQueryAllInfo = async () => {
+  // 仅刷新凭据状态（均衡/计数等）
+  const handleQueryStatus = async () => {
+    setQueryingStatus(true)
+    try {
+      const result = await refetch()
+      if (result.error) throw result.error
+      toast.success('状态已刷新')
+    } catch (e) {
+      toast.error(`状态刷新失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setQueryingStatus(false)
+    }
+  }
+
+  // 查询所有凭据余额
+  const handleQueryAllBalance = async () => {
     const ids = (data?.credentials || []).filter(c => !c.disabled).map(c => c.id)
     if (ids.length === 0) { toast.error('没有可查询的启用凭据'); return }
-    setQueryingInfo(true)
-    setQueryInfoProgress({ current: 0, total: ids.length })
+    setQueryingBalance(true)
+    setQueryBalanceProgress({ current: 0, total: ids.length })
     let ok = 0, fail = 0, autoDisabled = 0
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i]
       setLoadingBalanceIds(prev => new Set(prev).add(id))
       try {
-        const balance = await getCredentialBalance(id)
+        const balance = await getCredentialBalance(id, { forceRefresh: true })
         ok++
         setBalanceMap(prev => new Map(prev).set(id, balance))
       } catch (err: unknown) {
@@ -141,9 +158,9 @@ export function CredentialsTab() {
         }
       }
       finally { setLoadingBalanceIds(prev => { const n = new Set(prev); n.delete(id); return n }) }
-      setQueryInfoProgress({ current: i + 1, total: ids.length })
+      setQueryBalanceProgress({ current: i + 1, total: ids.length })
     }
-    setQueryingInfo(false)
+    setQueryingBalance(false)
     refetch()
     const msg = `查询：成功 ${ok}/${ids.length}` + (autoDisabled > 0 ? `，已自动禁用 ${autoDisabled} 个` : '')
     toast[fail === 0 ? 'success' : 'warning'](msg)
@@ -255,9 +272,13 @@ export function CredentialsTab() {
           )}
           {(data?.credentials?.length ?? 0) > 0 && (
             <>
-              <Button onClick={handleQueryAllInfo} size="sm" variant="outline" disabled={queryingInfo}>
-                <RefreshCw className={`h-4 w-4 mr-1 ${queryingInfo ? 'animate-spin' : ''}`} />
-                {queryingInfo ? `${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+              <Button onClick={handleQueryStatus} size="sm" variant="outline" disabled={queryingStatus}>
+                <RefreshCw className={`h-4 w-4 mr-1 ${queryingStatus ? 'animate-spin' : ''}`} />
+                {queryingStatus ? '查询中' : '查询'}
+              </Button>
+              <Button onClick={handleQueryAllBalance} size="sm" variant="outline" disabled={queryingBalance}>
+                <RefreshCw className={`h-4 w-4 mr-1 ${queryingBalance ? 'animate-spin' : ''}`} />
+                {queryingBalance ? `${queryBalanceProgress.current}/${queryBalanceProgress.total}` : '查询余额'}
               </Button>
               <Button onClick={async () => {
                 try { const res = await resetAllCounters(); toast.success(res.message); await refetch() }
@@ -324,7 +345,12 @@ export function CredentialsTab() {
         </DndContext>
       )}
 
-      <BalanceDialog credentialId={selectedCredentialId} open={balanceDialogOpen} onOpenChange={setBalanceDialogOpen} />
+      <BalanceDialog
+        credentialId={selectedCredentialId}
+        open={balanceDialogOpen}
+        onOpenChange={setBalanceDialogOpen}
+        refreshKey={balanceDialogRefreshKey}
+      />
       <AddCredentialDialog open={addDialogOpen} onOpenChange={setAddDialogOpen} />
       <BatchImportDialog open={batchImportDialogOpen} onOpenChange={setBatchImportDialogOpen} />
       <CredentialsEditorDialog open={credentialsEditorOpen} onOpenChange={setCredentialsEditorOpen} />

@@ -4,6 +4,10 @@ import json
 import logging
 import os
 import platform
+import threading
+import time
+from pathlib import Path
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -15,6 +19,14 @@ from admin.types import (
 )
 
 logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_MEMORY_BREAKDOWN_TOP_N = 8
+_MEMORY_BREAKDOWN_CACHE_TTL_SEC = 15.0
+_MEMORY_BREAKDOWN_CACHE_LOCK = threading.Lock()
+_MEMORY_BREAKDOWN_CACHE_AT = 0.0
+_MEMORY_BREAKDOWN_CACHE_ITEMS: list[dict[str, Any]] = []
+_MEMORY_BREAKDOWN_CACHE_TOTAL_MB = 0.0
+_TRACEMALLOC_INITIALIZED = False
 
 
 def _error_response(e: AdminServiceError) -> JSONResponse:
@@ -78,8 +90,9 @@ async def reset_all_counters(request: Request) -> JSONResponse:
 async def get_credential_balance(request: Request, id: int) -> JSONResponse:
     """GET /credentials/{id}/balance"""
     service = request.app.state.admin_service
+    force_refresh = request.query_params.get("forceRefresh", "").lower() in ("1", "true", "yes", "on")
     try:
-        response = await service.get_balance(id)
+        response = await service.get_balance(id, force_refresh=force_refresh)
     except AdminServiceError as e:
         return _error_response(e)
     return JSONResponse(content=response.to_dict())
@@ -245,6 +258,122 @@ def _get_process_memory_mb() -> float:
     return 0.0
 
 
+def _normalize_memory_module(filename: str) -> tuple[str, str]:
+    """把 tracemalloc 的文件路径映射为更稳定的模块名与展示路径。"""
+    path = Path(filename)
+    try:
+        path = path.resolve()
+    except Exception:
+        pass
+
+    try:
+        relative = path.relative_to(_PROJECT_ROOT)
+        display_path = str(relative).replace("\\", "/")
+        if relative.suffix == ".py":
+            module = ".".join(relative.with_suffix("").parts)
+        else:
+            module = ".".join(relative.parts)
+        return module, display_path
+    except Exception:
+        pass
+
+    parts = [p for p in path.parts if p]
+    if "site-packages" in parts:
+        index = parts.index("site-packages")
+        if index + 1 < len(parts):
+            package = parts[index + 1]
+            return package, f".../site-packages/{package}"
+
+    if path.suffix == ".py":
+        return path.stem, path.name
+    return path.name, path.name
+
+
+def _collect_memory_breakdown(limit: int) -> tuple[list[dict[str, Any]], float]:
+    """抓取 Python 内存分配明细（按模块聚合）。"""
+    global _TRACEMALLOC_INITIALIZED
+    try:
+        import tracemalloc
+    except Exception:
+        return [], 0.0
+
+    if not _TRACEMALLOC_INITIALIZED:
+        try:
+            tracemalloc.start(1)
+            _TRACEMALLOC_INITIALIZED = True
+        except Exception:
+            return [], 0.0
+
+    if not tracemalloc.is_tracing():
+        return [], 0.0
+
+    try:
+        snapshot = tracemalloc.take_snapshot()
+    except Exception:
+        return [], 0.0
+
+    module_totals: dict[str, dict[str, Any]] = {}
+    traced_total_bytes = 0
+
+    for stat in snapshot.statistics("filename"):
+        if not stat.traceback:
+            continue
+
+        size_bytes = int(stat.size)
+        if size_bytes <= 0:
+            continue
+
+        traced_total_bytes += size_bytes
+        filename = stat.traceback[0].filename
+        module, display_path = _normalize_memory_module(filename)
+        existing = module_totals.get(module)
+        if existing is None:
+            existing = {"module": module, "path": display_path, "sizeBytes": 0}
+            module_totals[module] = existing
+        existing["sizeBytes"] += size_bytes
+
+    if traced_total_bytes <= 0 or not module_totals:
+        return [], 0.0
+
+    top_items = sorted(
+        module_totals.values(),
+        key=lambda item: item["sizeBytes"],
+        reverse=True,
+    )[:max(1, limit)]
+
+    breakdown: list[dict[str, Any]] = []
+    for item in top_items:
+        size_bytes = int(item["sizeBytes"])
+        breakdown.append({
+            "module": str(item["module"]),
+            "path": str(item["path"]),
+            "memoryMb": round(size_bytes / (1024 * 1024), 2),
+            "sharePercent": round((size_bytes / traced_total_bytes) * 100, 1),
+        })
+
+    return breakdown, round(traced_total_bytes / (1024 * 1024), 2)
+
+
+def _get_memory_breakdown(limit: int = _MEMORY_BREAKDOWN_TOP_N) -> tuple[list[dict[str, Any]], float]:
+    """获取缓存后的内存明细，降低高频轮询开销。"""
+    global _MEMORY_BREAKDOWN_CACHE_AT, _MEMORY_BREAKDOWN_CACHE_ITEMS, _MEMORY_BREAKDOWN_CACHE_TOTAL_MB
+
+    now = time.time()
+    with _MEMORY_BREAKDOWN_CACHE_LOCK:
+        if now - _MEMORY_BREAKDOWN_CACHE_AT < _MEMORY_BREAKDOWN_CACHE_TTL_SEC:
+            cached_items = [dict(item) for item in _MEMORY_BREAKDOWN_CACHE_ITEMS]
+            return cached_items, _MEMORY_BREAKDOWN_CACHE_TOTAL_MB
+
+    items, total_mb = _collect_memory_breakdown(limit=limit)
+
+    with _MEMORY_BREAKDOWN_CACHE_LOCK:
+        _MEMORY_BREAKDOWN_CACHE_AT = now
+        _MEMORY_BREAKDOWN_CACHE_ITEMS = [dict(item) for item in items]
+        _MEMORY_BREAKDOWN_CACHE_TOTAL_MB = total_mb
+
+    return items, total_mb
+
+
 def _get_cpu_percent() -> float:
     """获取系统 CPU 使用率，跨平台"""
     try:
@@ -303,9 +432,12 @@ async def get_system_stats(request: Request) -> JSONResponse:
     loop = asyncio.get_event_loop()
     cpu = await loop.run_in_executor(None, _get_cpu_percent)
     mem = _get_process_memory_mb()
+    memory_breakdown, traced_memory_mb = _get_memory_breakdown()
     return JSONResponse(content={
         "cpuPercent": cpu,
         "memoryMb": round(mem, 1),
+        "memoryBreakdown": memory_breakdown,
+        "tracedMemoryMb": traced_memory_mb,
     })
 
 

@@ -29,6 +29,12 @@ class CredentialStatusItem:
     balance_score: Optional[int] = None  # 均衡点数（-100 ~ 100）
     balance_decay: Optional[int] = None  # 时间减益分量
     balance_rpm: Optional[int] = None    # 单凭据 RPM 分量
+    balance_current_usage: Optional[float] = None
+    balance_usage_limit: Optional[float] = None
+    balance_remaining: Optional[float] = None
+    balance_usage_percentage: Optional[float] = None
+    balance_next_reset_at: Optional[float] = None
+    balance_updated_at: Optional[str] = None
     disabled_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -54,6 +60,24 @@ class CredentialStatusItem:
             "balanceRpm": self.balance_rpm,
             "disabledReason": self.disabled_reason,
         }
+        if any(v is not None for v in (
+            self.balance_current_usage,
+            self.balance_usage_limit,
+            self.balance_remaining,
+            self.balance_usage_percentage,
+            self.balance_next_reset_at,
+        )):
+            d["cachedBalance"] = {
+                "id": self.id,
+                "subscriptionTitle": self.subscription_title,
+                "currentUsage": self.balance_current_usage or 0.0,
+                "usageLimit": self.balance_usage_limit or 0.0,
+                "remaining": self.balance_remaining or 0.0,
+                "usagePercentage": self.balance_usage_percentage or 0.0,
+                "nextResetAt": self.balance_next_reset_at,
+            }
+        if self.balance_updated_at is not None:
+            d["balanceUpdatedAt"] = self.balance_updated_at
         if self.proxy_url is not None:
             d["proxyUrl"] = self.proxy_url
         return d

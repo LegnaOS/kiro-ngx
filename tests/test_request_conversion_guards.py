@@ -11,6 +11,7 @@ from anthropic_api.handlers import (
     _map_provider_error,
     _handle_non_stream_request,
     _needs_capacity_compaction,
+    _prune_history_for_capacity,
     _validate_outbound_kiro_request,
 )
 from anthropic_api.types import MessagesRequest
@@ -218,6 +219,36 @@ class HandlerPreflightTest(unittest.TestCase):
         self.assertLess(len(hist_text), len(long_text))
         self.assertLess(len(cur_text), len(long_text))
         self.assertLess(len(tool_desc), 6000)
+
+    def test_prune_history_for_capacity_drops_old_entries_when_still_too_heavy(self):
+        history = []
+        for idx in range(80):
+            history.append({
+                "userInputMessage": {
+                    "content": f"entry-{idx}-" + ("z" * 3000),
+                    "modelId": "claude-sonnet-4-5",
+                }
+            })
+        kiro_request = {
+            "conversationState": {
+                "history": history,
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "current",
+                        "modelId": "claude-sonnet-4-5",
+                    }
+                },
+            }
+        }
+        start_len = len(history)
+        dropped, body, metrics = _prune_history_for_capacity(
+            kiro_request,
+            token_counter.PayloadMetrics(tokens=200_000, chars=600_000, bytes=700_000),
+        )
+        self.assertGreater(dropped, 0)
+        self.assertLess(len(kiro_request["conversationState"]["history"]), start_len)
+        self.assertIsInstance(body, str)
+        self.assertGreater(metrics.tokens, 0)
 
     def test_map_provider_error_returns_model_not_supported_for_invalid_model_id(self):
         response = _map_provider_error(

@@ -21,11 +21,14 @@ export function useCredentials() {
 }
 
 // 查询凭据余额
-export function useCredentialBalance(id: number | null) {
+export function useCredentialBalance(
+  id: number | null,
+  options?: { forceRefresh?: boolean; enabled?: boolean; refreshKey?: number }
+) {
   return useQuery({
-    queryKey: ['credential-balance', id],
-    queryFn: () => getCredentialBalance(id!),
-    enabled: id !== null,
+    queryKey: ['credential-balance', id, Boolean(options?.forceRefresh), options?.refreshKey ?? 0],
+    queryFn: () => getCredentialBalance(id!, { forceRefresh: options?.forceRefresh }),
+    enabled: (options?.enabled ?? true) && id !== null,
     retry: false,
   })
 }

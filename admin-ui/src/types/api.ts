@@ -29,6 +29,8 @@ export interface CredentialStatusItem {
   balanceScore: number | null  // 动态均衡评分（越低越优先）
   balanceDecay: number | null  // 时间减益分量
   balanceRpm: number | null    // 单凭据 RPM 分量
+  cachedBalance?: BalanceResponse
+  balanceUpdatedAt?: string | null
   disabledReason?: string | null
 }
 
@@ -139,4 +141,18 @@ export interface RuntimeLogResponse {
   entries: RuntimeLogEntry[]
   nextCursor: number
   bufferSize: number
+}
+
+export interface MemoryBreakdownItem {
+  module: string
+  path: string
+  memoryMb: number
+  sharePercent: number
+}
+
+export interface SystemStats {
+  cpuPercent: number
+  memoryMb: number
+  memoryBreakdown?: MemoryBreakdownItem[]
+  tracedMemoryMb?: number
 }

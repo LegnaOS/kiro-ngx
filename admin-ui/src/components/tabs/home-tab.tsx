@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { Activity, Zap, TrendingUp, Hash, Server, Cpu, HardDrive, ArrowUpRight, ArrowDownRight } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { getRequestStats, getSystemStats } from '@/api/credentials'
-import type { RequestStats } from '@/types/api'
+import type { MemoryBreakdownItem, RequestStats, SystemStats } from '@/types/api'
 
 // 凭据 ID 对应的颜色
 const CRED_COLORS = [
@@ -21,7 +23,7 @@ interface HomeTabProps {
 
 export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
   const [stats, setStats] = useState<RequestStats | null>(null)
-  const [sysStats, setSysStats] = useState<{ cpuPercent: number; memoryMb: number } | null>(null)
+  const [sysStats, setSysStats] = useState<SystemStats | null>(null)
 
   useEffect(() => {
     const fetchAll = () => {
@@ -63,7 +65,13 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
       </div>
       <div className="grid gap-4 grid-cols-2 md:grid-cols-2">
         <StatCard icon={<Cpu className="h-4 w-4" />} label="CPU 使用率" value={sysStats ? `${sysStats.cpuPercent}%` : '-'} />
-        <StatCard icon={<HardDrive className="h-4 w-4" />} label="进程内存" value={sysStats ? `${sysStats.memoryMb} MB` : '-'} />
+        <MemoryStatCard
+          icon={<HardDrive className="h-4 w-4" />}
+          label="进程内存"
+          memoryMb={sysStats?.memoryMb}
+          breakdown={sysStats?.memoryBreakdown ?? []}
+          tracedMemoryMb={sysStats?.tracedMemoryMb}
+        />
       </div>
 
       {/* 模型调用统计 - 多段柱状图 */}
@@ -96,6 +104,64 @@ export function HomeTab({ credentialCount, availableCount }: HomeTabProps) {
         </Card>
       )}
     </div>
+  )
+}
+
+function MemoryStatCard({ icon, label, memoryMb, breakdown, tracedMemoryMb }: {
+  icon: React.ReactNode
+  label: string
+  memoryMb?: number
+  breakdown: MemoryBreakdownItem[]
+  tracedMemoryMb?: number
+}) {
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const hasBreakdown = breakdown.length > 0
+
+  return (
+    <>
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardTitle className="text-sm font-medium text-muted-foreground">{label}</CardTitle>
+          {icon}
+        </CardHeader>
+        <CardContent>
+          <div className="text-2xl font-bold">{typeof memoryMb === 'number' ? `${memoryMb} MB` : '-'}</div>
+          <Button className="mt-3 h-7 px-2.5 text-xs" variant="outline" onClick={() => setDialogOpen(true)}>
+            查看详细占用
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="sm:max-w-xl max-h-[80vh] flex flex-col">
+          <DialogHeader>
+            <DialogTitle>进程内存详情</DialogTitle>
+            <DialogDescription>
+              当前进程 RSS：{typeof memoryMb === 'number' ? `${memoryMb} MB` : 'N/A'}；Python tracemalloc 可追踪内存：
+              {typeof tracedMemoryMb === 'number' ? ` ${tracedMemoryMb.toFixed(2)} MB` : ' N/A'}
+            </DialogDescription>
+          </DialogHeader>
+
+          {hasBreakdown ? (
+            <div className="space-y-2 overflow-y-auto pr-1">
+              {breakdown.map((item) => (
+                <div key={`${item.module}-${item.path}`} className="rounded-md border p-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs truncate" title={item.path}>{item.module}</span>
+                    <span className="ml-auto text-sm font-semibold">{item.memoryMb.toFixed(2)} MB</span>
+                  </div>
+                  <div className="text-[11px] text-muted-foreground mt-1">
+                    占比 {item.sharePercent.toFixed(1)}% · {item.path}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">暂无可用明细，请稍后重试。</div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 

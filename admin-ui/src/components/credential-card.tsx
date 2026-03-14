@@ -83,6 +83,7 @@ export function CredentialCard({
   const barPercent = hasScore ? Math.min(100, Math.max(0, (score + 100) / 2)) : 0
   const decay = credential.balanceDecay ?? 0
   const credRpm = credential.balanceRpm ?? 0
+  const effectiveBalance = balance ?? credential.cachedBalance ?? null
 
   return (
     <>
@@ -127,7 +128,7 @@ export function CredentialCard({
               <span className="text-muted-foreground">订阅 </span>
               <span className="font-medium">
                 {loadingBalance ? <Loader2 className="inline w-3 h-3 animate-spin" />
-                  : credential.subscriptionTitle || balance?.subscriptionTitle || '未知'}
+                  : credential.subscriptionTitle || effectiveBalance?.subscriptionTitle || '未知'}
               </span>
             </div>
             <div>
@@ -150,18 +151,23 @@ export function CredentialCard({
             </div>
           </div>
 
-          {balance && (() => {
-            const remaining = 100 - balance.usagePercentage
+          {effectiveBalance && (() => {
+            const remaining = 100 - effectiveBalance.usagePercentage
             const barColor = remaining > 60 ? 'bg-green-500' : remaining > 30 ? 'bg-yellow-500' : 'bg-red-500'
             return (
               <div className="text-xs">
                 <div className="flex justify-between mb-0.5">
                   <span className="text-muted-foreground">剩余</span>
-                  <span>{balance.remaining.toFixed(1)} / {balance.usageLimit.toFixed(1)} ({remaining.toFixed(0)}%)</span>
+                  <span>{effectiveBalance.remaining.toFixed(1)} / {effectiveBalance.usageLimit.toFixed(1)} ({remaining.toFixed(0)}%)</span>
                 </div>
                 <div className="h-1.5 bg-muted rounded-full overflow-hidden">
                   <div className={`h-full rounded-full transition-all ${barColor}`} style={{ width: `${remaining}%` }} />
                 </div>
+                {credential.balanceUpdatedAt && (
+                  <div className="text-[11px] text-muted-foreground mt-1">
+                    更新于 {formatLastUsed(credential.balanceUpdatedAt)}
+                  </div>
+                )}
               </div>
             )
           })()}

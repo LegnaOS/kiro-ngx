@@ -1,9 +1,12 @@
 """Admin API 业务逻辑服务 - 参考 src/admin/service.rs"""
 
+import asyncio
 import json
 import logging
 import time
 import threading
+from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # 余额缓存过期时间（秒）
 BALANCE_CACHE_TTL_SECS = 300
+AUTO_BALANCE_REFRESH_INTERVAL_SECS = 600
 
 
 class AdminService:
@@ -37,6 +41,8 @@ class AdminService:
         self._groups_path: Optional[Path] = None
         self._routing_path: Optional[Path] = None
         self._custom_models: list[str] = []
+        self._auto_balance_task: Optional[asyncio.Task] = None
+        self._auto_balance_stop: Optional[asyncio.Event] = None
 
         cache_dir = getattr(token_manager, "cache_dir", None)
         if callable(cache_dir):
@@ -54,11 +60,14 @@ class AdminService:
         """获取所有凭据状态"""
         snapshot = self.token_manager.snapshot()
         credentials = []
-        now = time.time()
+        with self._cache_lock:
+            cached_map = {cid: {"cached_at": v["cached_at"], "data": v["data"]} for cid, v in self._balance_cache.items()}
 
         for entry in snapshot.entries:
             # 自动分组：FREE → free，其他 → pro（除非手动设为 priority）
-            sub_title = entry.subscription_title
+            cached = cached_map.get(entry.id)
+            cached_balance = cached["data"] if cached else None
+            sub_title = entry.subscription_title or (cached_balance.subscription_title if cached_balance else None)
             saved_group = self._groups.get(entry.id)
             is_free = sub_title and "FREE" in sub_title.upper()
             if is_free:
@@ -72,6 +81,26 @@ class AdminService:
             balance_score = entry.balance_score if not entry.disabled else None
             balance_decay = entry.balance_decay if not entry.disabled else None
             balance_rpm = entry.balance_rpm if not entry.disabled else None
+            balance_current_usage = entry.balance_current_usage
+            balance_usage_limit = entry.balance_usage_limit
+            balance_remaining = entry.balance_remaining
+            balance_usage_percentage = entry.balance_usage_percentage
+            balance_next_reset_at = entry.balance_next_reset_at
+            balance_updated_at = entry.balance_updated_at
+
+            if cached_balance:
+                if balance_current_usage is None:
+                    balance_current_usage = cached_balance.current_usage
+                if balance_usage_limit is None:
+                    balance_usage_limit = cached_balance.usage_limit
+                if balance_remaining is None:
+                    balance_remaining = cached_balance.remaining
+                if balance_usage_percentage is None:
+                    balance_usage_percentage = cached_balance.usage_percentage
+                if balance_next_reset_at is None:
+                    balance_next_reset_at = cached_balance.next_reset_at
+                if balance_updated_at is None:
+                    balance_updated_at = datetime.fromtimestamp(cached["cached_at"], timezone.utc).isoformat()
 
             credentials.append(CredentialStatusItem(
                 id=entry.id,
@@ -94,6 +123,12 @@ class AdminService:
                 balance_score=balance_score,
                 balance_decay=balance_decay,
                 balance_rpm=balance_rpm,
+                balance_current_usage=balance_current_usage,
+                balance_usage_limit=balance_usage_limit,
+                balance_remaining=balance_remaining,
+                balance_usage_percentage=balance_usage_percentage,
+                balance_next_reset_at=balance_next_reset_at,
+                balance_updated_at=balance_updated_at,
                 disabled_reason=entry.disabled_reason,
             ))
 
@@ -190,6 +225,72 @@ class AdminService:
             "details": details,
             "failed": failed,
         }
+
+    async def refresh_all_balances(self, include_disabled: bool = True, force_refresh: bool = True) -> dict:
+        """刷新全部凭据余额并更新缓存/持久化快照。"""
+        snapshot = self.token_manager.snapshot()
+        ids = [entry.id for entry in snapshot.entries if include_disabled or not entry.disabled]
+        succeeded = 0
+        failed: list[dict] = []
+
+        for cid in ids:
+            try:
+                await self.get_balance(cid, force_refresh=force_refresh)
+                succeeded += 1
+            except Exception as e:
+                failed.append({"id": cid, "error": str(e)})
+
+        return {
+            "credentialCount": len(ids),
+            "succeededCount": succeeded,
+            "failedCount": len(failed),
+            "failed": failed,
+        }
+
+    def start_auto_balance_refresh(self) -> None:
+        """启动后台余额自动刷新（10 分钟一次）。"""
+        if self._auto_balance_task and not self._auto_balance_task.done():
+            return
+        self._auto_balance_stop = asyncio.Event()
+        self._auto_balance_task = asyncio.create_task(self._auto_balance_refresh_loop())
+        logger.info("已启动余额自动刷新任务（间隔 %d 秒）", AUTO_BALANCE_REFRESH_INTERVAL_SECS)
+
+    async def stop_auto_balance_refresh(self) -> None:
+        """停止后台余额自动刷新任务。"""
+        if self._auto_balance_stop:
+            self._auto_balance_stop.set()
+        if self._auto_balance_task:
+            self._auto_balance_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._auto_balance_task
+        self._auto_balance_task = None
+        self._auto_balance_stop = None
+
+    async def _auto_balance_refresh_loop(self) -> None:
+        while True:
+            if self._auto_balance_stop and self._auto_balance_stop.is_set():
+                break
+
+            try:
+                result = await self.refresh_all_balances(include_disabled=True, force_refresh=True)
+                logger.info(
+                    "自动余额刷新完成：成功 %d/%d，失败 %d",
+                    result["succeededCount"],
+                    result["credentialCount"],
+                    result["failedCount"],
+                )
+            except Exception as e:
+                logger.warning("自动余额刷新失败: %s", e)
+
+            if not self._auto_balance_stop:
+                await asyncio.sleep(AUTO_BALANCE_REFRESH_INTERVAL_SECS)
+                continue
+
+            try:
+                await asyncio.wait_for(self._auto_balance_stop.wait(), timeout=AUTO_BALANCE_REFRESH_INTERVAL_SECS)
+                break
+            except asyncio.TimeoutError:
+                continue
 
     async def _fetch_balance(self, id: int) -> BalanceResponse:
         """从上游获取余额"""
@@ -466,22 +567,20 @@ class AdminService:
             return
         try:
             data = json.loads(self._cache_path.read_text(encoding="utf-8"))
-            now = time.time()
             for k, v in data.items():
-                if (now - v.get("cached_at", 0)) < BALANCE_CACHE_TTL_SECS:
-                    bd = v["data"]
-                    self._balance_cache[int(k)] = {
-                        "cached_at": v["cached_at"],
-                        "data": BalanceResponse(
-                            id=bd.get("id", 0),
-                            subscription_title=bd.get("subscriptionTitle"),
-                            current_usage=bd.get("currentUsage", 0.0),
-                            usage_limit=bd.get("usageLimit", 0.0),
-                            remaining=bd.get("remaining", 0.0),
-                            usage_percentage=bd.get("usagePercentage", 0.0),
-                            next_reset_at=bd.get("nextResetAt"),
-                        ),
-                    }
+                bd = v["data"]
+                self._balance_cache[int(k)] = {
+                    "cached_at": v.get("cached_at", 0),
+                    "data": BalanceResponse(
+                        id=bd.get("id", 0),
+                        subscription_title=bd.get("subscriptionTitle"),
+                        current_usage=bd.get("currentUsage", 0.0),
+                        usage_limit=bd.get("usageLimit", 0.0),
+                        remaining=bd.get("remaining", 0.0),
+                        usage_percentage=bd.get("usagePercentage", 0.0),
+                        next_reset_at=bd.get("nextResetAt"),
+                    ),
+                }
         except Exception as e:
             logger.warning("解析余额缓存失败，将忽略: %s", e)
 

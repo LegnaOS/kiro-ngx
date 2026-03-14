@@ -37,8 +37,13 @@ COMPACT_TRIGGER_BYTES = 240_000
 COMPACT_TRIGGER_CHARS = 190_000
 COMPACT_CURRENT_TOOL_RESULT_MAX_CHARS = 4_000
 COMPACT_HISTORY_TOOL_RESULT_MAX_CHARS = 1_500
-COMPACT_TOOL_DESCRIPTION_MAX_CHARS = 1_800
+COMPACT_TOOL_DESCRIPTION_MAX_CHARS = 900
 COMPACT_OLD_HISTORY_CONTENT_MAX_CHARS = 1_200
+EMERGENCY_HISTORY_TARGET_TOKENS = 120_000
+EMERGENCY_HISTORY_TARGET_BYTES = 360_000
+EMERGENCY_HISTORY_TARGET_CHARS = 320_000
+EMERGENCY_HISTORY_MIN_MESSAGES = 28
+EMERGENCY_HISTORY_DROP_BATCH = 10
 FALLBACK_JSON_CANDIDATE_PREFIXES = (
     '{"content":',
     '{"name":',
@@ -291,6 +296,44 @@ def _needs_capacity_compaction(metrics: token_module.PayloadMetrics) -> bool:
         or metrics.bytes >= COMPACT_TRIGGER_BYTES
         or metrics.chars >= COMPACT_TRIGGER_CHARS
     )
+
+
+def _estimate_request_body_and_metrics(kiro_request: Dict[str, Any]) -> tuple[str, token_module.PayloadMetrics]:
+    body = json.dumps(kiro_request, ensure_ascii=False)
+    metrics = token_module.estimate_kiro_payload_metrics(kiro_request)
+    return body, metrics
+
+
+def _metrics_still_too_heavy(metrics: token_module.PayloadMetrics) -> bool:
+    return (
+        metrics.tokens >= EMERGENCY_HISTORY_TARGET_TOKENS
+        or metrics.bytes >= EMERGENCY_HISTORY_TARGET_BYTES
+        or metrics.chars >= EMERGENCY_HISTORY_TARGET_CHARS
+    )
+
+
+def _prune_history_for_capacity(
+    kiro_request: Dict[str, Any],
+    metrics: token_module.PayloadMetrics,
+) -> tuple[int, str, token_module.PayloadMetrics]:
+    conversation_state = kiro_request.get("conversationState", {})
+    history = conversation_state.get("history")
+    if not isinstance(history, list):
+        body, recalculated = _estimate_request_body_and_metrics(kiro_request)
+        return 0, body, recalculated
+
+    dropped = 0
+    while _metrics_still_too_heavy(metrics) and len(history) > EMERGENCY_HISTORY_MIN_MESSAGES:
+        removable = len(history) - EMERGENCY_HISTORY_MIN_MESSAGES
+        drop_now = min(EMERGENCY_HISTORY_DROP_BATCH, removable)
+        if drop_now <= 0:
+            break
+        del history[:drop_now]
+        dropped += drop_now
+        _, metrics = _estimate_request_body_and_metrics(kiro_request)
+
+    body, metrics = _estimate_request_body_and_metrics(kiro_request)
+    return dropped, body, metrics
 
 
 def _apply_capacity_compaction(kiro_request: Dict[str, Any]) -> Dict[str, int]:
@@ -1225,6 +1268,21 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
         except LocalRequestLimitError as e:
             return _local_limit_error_response(e)
         source_tag = "initial_compacted"
+        if _metrics_still_too_heavy(outbound_metrics):
+            dropped, request_body, outbound_metrics = _prune_history_for_capacity(kiro_request, outbound_metrics)
+            if dropped > 0:
+                logger.warning(
+                    "请求在降载后仍偏大，裁剪旧 history %d 条: tokens=%d chars=%d bytes=%d",
+                    dropped,
+                    outbound_metrics.tokens,
+                    outbound_metrics.chars,
+                    outbound_metrics.bytes,
+                )
+                try:
+                    outbound_metrics = _validate_outbound_kiro_request(kiro_request, request_body)
+                except LocalRequestLimitError as e:
+                    return _local_limit_error_response(e)
+                source_tag = "initial_compacted_pruned"
     _log_outbound_request_stats(
         source=source_tag,
         kiro_request=kiro_request,
@@ -1569,6 +1627,25 @@ async def _handle_stream_auto_continue(
                         anthropic_message_count=len(continuation_messages),
                         anthropic_tool_count=len(cont_payload.tools or []),
                     )
+                    if _metrics_still_too_heavy(continuation_metrics):
+                        dropped, cont_body, continuation_metrics = _prune_history_for_capacity(cont_kiro_req, continuation_metrics)
+                        if dropped > 0:
+                            logger.warning(
+                                "auto-continue 第 %d 轮降载后仍偏大，裁剪旧 history %d 条: tokens=%d chars=%d bytes=%d",
+                                round_idx + 1,
+                                dropped,
+                                continuation_metrics.tokens,
+                                continuation_metrics.chars,
+                                continuation_metrics.bytes,
+                            )
+                            continuation_metrics = _validate_outbound_kiro_request(cont_kiro_req, cont_body)
+                            _log_outbound_request_stats(
+                                source=f"auto_continue_{round_idx + 1}_compacted_pruned",
+                                kiro_request=cont_kiro_req,
+                                metrics=continuation_metrics,
+                                anthropic_message_count=len(continuation_messages),
+                                anthropic_tool_count=len(cont_payload.tools or []),
+                            )
                 input_tokens = max(input_tokens, continuation_metrics.tokens)
             except LocalRequestLimitError as e:
                 logger.warning("auto-continue 第 %d 轮本地预检拒绝发送: %s", round_idx + 1, e)
