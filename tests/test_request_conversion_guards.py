@@ -79,7 +79,7 @@ class ConverterGuardsTest(unittest.TestCase):
         self.assertEqual(normalized["items"]["type"], "object")
         self.assertEqual(normalized["items"]["properties"], {})
 
-    def test_convert_request_truncates_large_tool_result(self):
+    def test_convert_request_preserves_large_tool_result_like_a2(self):
         huge_result = "<task-notification>\n" + "\n".join(f"line {idx} " + ("x" * 120) for idx in range(600))
         payload = MessagesRequest(
             model="claude-sonnet-4-6",
@@ -103,9 +103,7 @@ class ConverterGuardsTest(unittest.TestCase):
 
         self.assertEqual(len(tool_results), 1)
         tool_text = tool_results[0].content[0]["text"]
-        self.assertIn("[summary] contains sub-agent/task transcript output", tool_text)
-        self.assertIn("task transcript truncated", tool_text)
-        self.assertLess(len(tool_text), len(huge_result))
+        self.assertEqual(tool_text, huge_result)
 
     def test_convert_request_moves_last_assistant_into_history(self):
         payload = MessagesRequest(
@@ -152,15 +150,40 @@ class ConverterGuardsTest(unittest.TestCase):
         self.assertEqual(schema["required"], [])
         self.assertTrue(schema["additionalProperties"])
 
+    def test_convert_request_filters_web_search_tool_like_a2(self):
+        payload = MessagesRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": [{"type": "text", "text": "search"}]},
+            ],
+            tools=[
+                {
+                    "name": "web_search",
+                    "type": "web_search_20250305",
+                    "description": "search the web",
+                    "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ],
+        )
+
+        result = convert_request(payload)
+        tools = result.conversation_state.current_message.user_input_message.user_input_message_context.tools
+
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0].tool_specification.name, "no_tool_available")
+        self.assertIn("placeholder", tools[0].tool_specification.description)
+
 
 class HandlerPreflightTest(unittest.TestCase):
     def test_capacity_compaction_trigger_uses_kiro_payload_metrics(self):
-        self.assertTrue(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=80_000, chars=100_000, bytes=110_000)))
-        self.assertTrue(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=10_000, chars=200_000, bytes=100_000)))
-        self.assertTrue(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=10_000, chars=100_000, bytes=250_000)))
+        self.assertFalse(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=80_000, chars=100_000, bytes=110_000)))
+        self.assertFalse(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=10_000, chars=200_000, bytes=100_000)))
+        self.assertFalse(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=10_000, chars=100_000, bytes=250_000)))
         self.assertFalse(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=30_000, chars=80_000, bytes=90_000)))
+        self.assertTrue(_needs_capacity_compaction(token_counter.PayloadMetrics(tokens=181_000, chars=100_000, bytes=110_000)))
 
-    def test_apply_capacity_compaction_shrinks_tool_results_and_tool_descriptions(self):
+    def test_apply_capacity_compaction_is_noop_to_match_a2(self):
         long_text = "x" * 5000
         kiro_request = {
             "conversationState": {
@@ -199,10 +222,10 @@ class HandlerPreflightTest(unittest.TestCase):
         }
 
         stats = _apply_capacity_compaction(kiro_request)
-        self.assertGreaterEqual(stats["history_tool_results"], 1)
-        self.assertGreaterEqual(stats["current_tool_results"], 1)
-        self.assertGreaterEqual(stats["tools"], 1)
-        self.assertGreaterEqual(stats["history_contents"], 0)
+        self.assertEqual(stats["history_tool_results"], 0)
+        self.assertEqual(stats["current_tool_results"], 0)
+        self.assertEqual(stats["tools"], 0)
+        self.assertEqual(stats["history_contents"], 0)
 
         hist_text = (
             kiro_request["conversationState"]["history"][0]["userInputMessage"]["userInputMessageContext"]
@@ -216,11 +239,11 @@ class HandlerPreflightTest(unittest.TestCase):
             kiro_request["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
             ["tools"][0]["toolSpecification"]["description"]
         )
-        self.assertLess(len(hist_text), len(long_text))
-        self.assertLess(len(cur_text), len(long_text))
-        self.assertLess(len(tool_desc), 6000)
+        self.assertEqual(len(hist_text), len(long_text))
+        self.assertEqual(len(cur_text), len(long_text))
+        self.assertEqual(len(tool_desc), 6000)
 
-    def test_prune_history_for_capacity_drops_old_entries_when_still_too_heavy(self):
+    def test_prune_history_for_capacity_is_effectively_disabled_below_hard_limit(self):
         history = []
         for idx in range(80):
             history.append({
@@ -243,10 +266,10 @@ class HandlerPreflightTest(unittest.TestCase):
         start_len = len(history)
         dropped, body, metrics = _prune_history_for_capacity(
             kiro_request,
-            token_counter.PayloadMetrics(tokens=200_000, chars=600_000, bytes=700_000),
+            token_counter.PayloadMetrics(tokens=150_000, chars=600_000, bytes=700_000),
         )
-        self.assertGreater(dropped, 0)
-        self.assertLess(len(kiro_request["conversationState"]["history"]), start_len)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(kiro_request["conversationState"]["history"]), start_len)
         self.assertIsInstance(body, str)
         self.assertGreater(metrics.tokens, 0)
 

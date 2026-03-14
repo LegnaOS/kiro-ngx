@@ -227,6 +227,7 @@ class StreamContext:
         self._accumulated_text_parts: List[str] = []  # 累积文本片段，用于日志记录
         self.web_search_tool_uses: List[Dict[str, Any]] = []  # 记录 web_search tool_use
         self._tool_json_buffers: Dict[str, str] = {}  # tool_use_id → 累积的 JSON 字符串
+        self._tool_names: Dict[str, str] = {}  # tool_use_id -> 最近一次观察到的工具名
         self._last_assistant_content: Optional[str] = None
 
     @property
@@ -444,6 +445,8 @@ class StreamContext:
             events.extend(self._create_text_delta_events(buffered))
 
         # 参数分片先缓存；仅在 stop=true 时对下游输出完整 tool_use，避免半截 tool_call 污染会话。
+        if tool_use.tool_use_id and tool_use.name:
+            self._tool_names[tool_use.tool_use_id] = tool_use.name
         if tool_use.input:
             if not isinstance(tool_use.input, str):
                 logger.warning("流式 ToolUseEvent.input 类型异常: id=%s, name=%s, type=%s",
@@ -498,6 +501,7 @@ class StreamContext:
                 })
             self._tool_json_buffers.pop(tool_use.tool_use_id, None)
             self.tool_block_indices.pop(tool_use.tool_use_id, None)
+            self._tool_names.pop(tool_use.tool_use_id, None)
 
         return events
 
@@ -541,19 +545,41 @@ class StreamContext:
             self.state_manager.set_stop_reason("max_tokens")
             events.extend(self._create_text_delta_events(" "))
 
-        # 未完成的 tool_use 不应伪装成正常结束，否则客户端会把半截响应当成成功。
+        # 向 A2 靠拢：未完成的 tool_use 在流末尾尽量收尾输出，而不是直接抛异常炸流。
         if self._tool_json_buffers:
-            fragments = []
             for tid in list(self._tool_json_buffers.keys()):
-                pending_len = len(self._tool_json_buffers.get(tid, ""))
-                logger.error(
-                    "检测到未完成 tool_use，中止流式响应: tool_use_id=%s, pending_input_len=%d",
-                    tid, pending_len,
+                final_input = self._tool_json_buffers.get(tid, "")
+                tool_name = self._tool_names.get(tid, "") or "unknown_tool"
+                pending_len = len(final_input)
+                logger.warning(
+                    "检测到未完成 tool_use，按 A2 风格收尾输出: tool_use_id=%s, name=%s, pending_input_len=%d",
+                    tid, tool_name, pending_len,
                 )
-                fragments.append(f"{tid}:{pending_len}")
+                self.state_manager.set_has_tool_use(True)
+                block_index = self.tool_block_indices.get(tid)
+                if block_index is None:
+                    block_index = self.state_manager.next_block_index()
+                    self.tool_block_indices[tid] = block_index
+                events.extend(self.state_manager.handle_content_block_start(block_index, "tool_use", {
+                    "type": "content_block_start", "index": block_index,
+                    "content_block": {
+                        "type": "tool_use", "id": tid,
+                        "name": tool_name, "input": {},
+                    },
+                }))
+                if final_input:
+                    delta = self.state_manager.handle_content_block_delta(block_index, {
+                        "type": "content_block_delta", "index": block_index,
+                        "delta": {"type": "input_json_delta", "partial_json": final_input},
+                    })
+                    if delta:
+                        events.append(delta)
+                stop = self.state_manager.handle_content_block_stop(block_index)
+                if stop:
+                    events.append(stop)
                 self._tool_json_buffers.pop(tid, None)
                 self.tool_block_indices.pop(tid, None)
-            raise IncompleteToolUseError("未完成 tool_use: " + ", ".join(fragments))
+                self._tool_names.pop(tid, None)
 
         final_input = self.resolve_input_tokens()
         events.extend(self.state_manager.generate_final_events(final_input, self.output_tokens))

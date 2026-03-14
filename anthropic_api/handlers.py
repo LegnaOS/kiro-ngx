@@ -291,10 +291,12 @@ def _compact_history_contents(history: Any, max_chars: int) -> int:
 
 
 def _needs_capacity_compaction(metrics: token_module.PayloadMetrics) -> bool:
+    # A2 不会在离上限还很远时就主动裁切上下文。
+    # 这里把降载触发条件收紧到接近本地硬限制时再介入，避免长会话被反复切碎。
     return (
-        metrics.tokens >= COMPACT_TRIGGER_TOKENS
-        or metrics.bytes >= COMPACT_TRIGGER_BYTES
-        or metrics.chars >= COMPACT_TRIGGER_CHARS
+        metrics.tokens >= int(LOCAL_CONTEXT_TOKEN_LIMIT * 0.98)
+        or metrics.bytes >= int(LOCAL_REQUEST_MAX_BYTES * 0.92)
+        or metrics.chars >= int(LOCAL_REQUEST_MAX_CHARS * 0.92)
     )
 
 
@@ -305,10 +307,12 @@ def _estimate_request_body_and_metrics(kiro_request: Dict[str, Any]) -> tuple[st
 
 
 def _metrics_still_too_heavy(metrics: token_module.PayloadMetrics) -> bool:
+    # 向 A2 靠拢：不再在远低于本地硬上限时触发 emergency history prune。
+    # 只保留“已超过本地硬上限”的兜底判断，避免长会话被静默裁断。
     return (
-        metrics.tokens >= EMERGENCY_HISTORY_TARGET_TOKENS
-        or metrics.bytes >= EMERGENCY_HISTORY_TARGET_BYTES
-        or metrics.chars >= EMERGENCY_HISTORY_TARGET_CHARS
+        metrics.tokens > LOCAL_CONTEXT_TOKEN_LIMIT
+        or metrics.bytes > LOCAL_REQUEST_MAX_BYTES
+        or metrics.chars > LOCAL_REQUEST_MAX_CHARS
     )
 
 
@@ -326,6 +330,9 @@ def _prune_history_for_capacity(
     while _metrics_still_too_heavy(metrics) and len(history) > EMERGENCY_HISTORY_MIN_MESSAGES:
         removable = len(history) - EMERGENCY_HISTORY_MIN_MESSAGES
         drop_now = min(EMERGENCY_HISTORY_DROP_BATCH, removable)
+        # 尽量按完整回合裁剪，避免把 user/tool_result 与 assistant/tool_use 拆散。
+        if drop_now % 2 != 0:
+            drop_now -= 1
         if drop_now <= 0:
             break
         del history[:drop_now]
@@ -337,50 +344,13 @@ def _prune_history_for_capacity(
 
 
 def _apply_capacity_compaction(kiro_request: Dict[str, Any]) -> Dict[str, int]:
-    conversation_state = kiro_request.get("conversationState", {})
-    history = conversation_state.get("history", [])
-    current = (
-        conversation_state.get("currentMessage", {})
-        .get("userInputMessage", {})
-    )
-    current_ctx = current.get("userInputMessageContext", {})
-    current_tools = current_ctx.get("tools", [])
-    current_tool_results = current_ctx.get("toolResults", [])
-
-    history_tool_results_compacted = 0
-    if isinstance(history, list):
-        for item in history:
-            if not isinstance(item, dict):
-                continue
-            user_msg = item.get("userInputMessage")
-            if not isinstance(user_msg, dict):
-                continue
-            ctx = user_msg.get("userInputMessageContext", {})
-            history_tool_results_compacted += _compact_tool_results(
-                ctx.get("toolResults"),
-                max_chars=COMPACT_HISTORY_TOOL_RESULT_MAX_CHARS,
-                label="history tool_result",
-            )
-
-    current_tool_results_compacted = _compact_tool_results(
-        current_tool_results,
-        max_chars=COMPACT_CURRENT_TOOL_RESULT_MAX_CHARS,
-        label="current tool_result",
-    )
-    tools_compacted = _compact_tools_descriptions(
-        current_tools,
-        max_desc_chars=COMPACT_TOOL_DESCRIPTION_MAX_CHARS,
-    )
-    history_contents_compacted = _compact_history_contents(
-        history,
-        max_chars=COMPACT_OLD_HISTORY_CONTENT_MAX_CHARS,
-    )
-
+    # 向 A2 靠拢：发送前不再对 tool_result / tools / history 做二次本地截断。
+    # 这些内容在 converter 阶段已经完成必要整理，再压一次会明显增加续接断裂概率。
     return {
-        "history_tool_results": history_tool_results_compacted,
-        "current_tool_results": current_tool_results_compacted,
-        "tools": tools_compacted,
-        "history_contents": history_contents_compacted,
+        "history_tool_results": 0,
+        "current_tool_results": 0,
+        "tools": 0,
+        "history_contents": 0,
     }
 
 

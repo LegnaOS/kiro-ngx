@@ -301,21 +301,9 @@ def _classify_tool_result_text(text: str) -> Tuple[str, str]:
 
 
 def _shrink_tool_result_content(content: Any, history_distance: Optional[int] = None) -> str:
-    raw = _extract_tool_result_content(content)
-    kind, detail = _classify_tool_result_text(raw)
-    if history_distance is None:
-        max_chars = CURRENT_TOOL_RESULT_MAX_CHARS
-        max_lines = CURRENT_TOOL_RESULT_MAX_LINES
-        label = kind
-    else:
-        recent = history_distance <= RECENT_HISTORY_WINDOW
-        max_chars = CURRENT_TOOL_RESULT_MAX_CHARS if recent else HISTORY_TOOL_RESULT_MAX_CHARS
-        max_lines = CURRENT_TOOL_RESULT_MAX_LINES if recent else HISTORY_TOOL_RESULT_MAX_LINES
-        label = f"history {kind}#{history_distance}"
-    truncated = _truncate_middle(raw, max_chars=max_chars, max_lines=max_lines, label=label)
-    if truncated == raw:
-        return raw
-    return f"[summary] {detail}\n{truncated}"
+    # A2 不会在请求转换阶段主动裁切 tool_result。
+    # 这里保留原始内容，避免 continuation 依赖的工具上下文被提前破坏。
+    return _extract_tool_result_content(content)
 
 
 def _dedupe_tool_results(tool_results: List[ToolResult]) -> List[ToolResult]:
@@ -379,80 +367,58 @@ def _process_message_content(
     return "\n".join(part for part in text_parts if part), images, _dedupe_tool_results(tool_results)
 
 
-def _make_web_search_tool() -> Tool:
-    """将 web_search 转为普通 Kiro 工具定义"""
-    return Tool(
-        tool_specification=ToolSpecification(
-            name="web_search",
-            description="Search the web for current information. Use this when you need up-to-date information that may not be in your training data.",
-            input_schema=InputSchema.from_json({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "The search query"}},
-                "required": ["query"],
-            }),
-        )
-    )
-
-
 def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
-    """转换工具定义，仅在客户端发送 web_search 时转换"""
-    result = []
-    has_web_search = False
-    saw_real_tool = False
-    for t in (tools or []):
-        tool_type = t.get("type", "")
-        if tool_type and tool_type.startswith("web_search"):
-            if not has_web_search:
-                result.append(_make_web_search_tool())
-                has_web_search = True
-                saw_real_tool = True
+    """按 A2 的思路转换工具定义。"""
+    if not tools:
+        logger.info("未提供工具，插入 A2 风格占位工具")
+        return [_create_placeholder_tool("no_tool_available")]
+
+    result: List[Tool] = []
+    filtered_tools: List[Dict[str, Any]] = []
+    for t in tools:
+        tool_type = str(t.get("type", "") or "")
+        name = str(t.get("name", "") or "")
+        lower_name = name.lower()
+        if tool_type.startswith("web_search") or lower_name in {"web_search", "websearch"}:
+            logger.info("按 A2 逻辑过滤工具: %s", name or tool_type)
             continue
+        filtered_tools.append(t)
+
+    for t in filtered_tools:
         name = t.get("name", "")
         if not name:
-            continue
-        if name == "web_search":
-            if not has_web_search:
-                result.append(_make_web_search_tool())
-                has_web_search = True
-                saw_real_tool = True
             continue
         desc = t.get("description", "")
         if not isinstance(desc, str) or not desc.strip():
             logger.info("跳过 description 为空的工具: %s", name)
             continue
-        suffix = ""
-        if name == "Write":
-            suffix = WRITE_TOOL_DESCRIPTION_SUFFIX
-        elif name == "Edit":
-            suffix = EDIT_TOOL_DESCRIPTION_SUFFIX
-        if suffix:
-            desc = f"{desc}\n{suffix}"
         if len(desc) > MAX_TOOL_DESCRIPTION_LENGTH:
             desc = desc[:MAX_TOOL_DESCRIPTION_LENGTH] + "..."
         schema = normalize_json_schema(t.get("input_schema", {}))
         result.append(Tool(
             tool_specification=ToolSpecification(
-                name=name, description=desc,
+                name=name,
+                description=desc,
                 input_schema=InputSchema.from_json(schema),
             )
         ))
-        saw_real_tool = True
 
-    if result or not tools:
+    if result:
         return result
-    if not saw_real_tool:
-        logger.info("所有工具均被降载过滤，插入占位工具")
-        return [_create_placeholder_tool("no_tool_available")]
-    return result
+
+    logger.info("所有工具均被过滤，插入 A2 风格占位工具")
+    return [_create_placeholder_tool("no_tool_available")]
 
 
 def _create_placeholder_tool(name: str) -> Tool:
-    """为历史中使用但不在 tools 列表中的工具创建占位符定义"""
+    """创建与 A2 一致的占位工具定义。"""
+    description = "This is a placeholder tool when no other tools are available. It does nothing."
+    if name != "no_tool_available":
+        description = "Tool used in conversation history"
     return Tool(
         tool_specification=ToolSpecification(
             name=name,
-            description="Tool used in conversation history",
+            description=description,
             input_schema=InputSchema.from_json({
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object", "properties": {},
@@ -461,6 +427,56 @@ def _create_placeholder_tool(name: str) -> Tool:
         )
     )
 # PLACEHOLDER_CONVERTER_PART3
+
+
+def _merge_adjacent_messages(messages: List[AnthropicMessage]) -> List[AnthropicMessage]:
+    merged: List[AnthropicMessage] = []
+    for msg in messages:
+        if not merged:
+            merged.append(AnthropicMessage(role=msg.role, content=msg.content))
+            continue
+
+        prev = merged[-1]
+        if msg.role != prev.role:
+            merged.append(AnthropicMessage(role=msg.role, content=msg.content))
+            continue
+
+        prev_content = prev.content
+        cur_content = msg.content
+        if isinstance(prev_content, list) and isinstance(cur_content, list):
+            prev.content = prev_content + cur_content
+        elif isinstance(prev_content, str) and isinstance(cur_content, str):
+            prev.content = f"{prev_content}\n{cur_content}" if prev_content and cur_content else (prev_content or cur_content)
+        elif isinstance(prev_content, list) and isinstance(cur_content, str):
+            prev.content = prev_content + ([{"type": "text", "text": cur_content}] if cur_content else [])
+        elif isinstance(prev_content, str) and isinstance(cur_content, list):
+            prefix = [{"type": "text", "text": prev_content}] if prev_content else []
+            prev.content = prefix + cur_content
+        else:
+            merged.append(AnthropicMessage(role=msg.role, content=msg.content))
+    return merged
+
+
+def _convert_history_user_message(msg: AnthropicMessage, model_id: str, history_distance: int) -> Message:
+    keep_images = history_distance <= RECENT_HISTORY_WINDOW
+    text, images, tool_results = _process_message_content(
+        msg.content,
+        keep_images=keep_images,
+        image_placeholder=not keep_images,
+        history_distance=history_distance,
+    )
+    user_msg = UserMessage.new(text, model_id)
+    if images:
+        user_msg.images = images
+    if tool_results:
+        user_msg.user_input_message_context = UserInputMessageContext(
+            tool_results=_dedupe_tool_results(tool_results),
+        )
+    return Message(HistoryUserMessage(user_input_message=user_msg))
+
+
+def _convert_history_assistant_message(msg: AnthropicMessage) -> Message:
+    return Message(_convert_assistant_message(msg))
 
 
 def _generate_thinking_prefix(req: MessagesRequest) -> Optional[str]:
@@ -571,15 +587,14 @@ def _merge_user_messages(messages: List[AnthropicMessage], model_id: str) -> His
 def _process_history_tools(
     history: List[Message], current_tool_results: List[ToolResult],
 ) -> Tuple[List[str], List[ToolResult]]:
-    """一次遍历完成：收集 tool_names、验证 tool_pairing、移除 orphaned tool_uses
+    """收集 history 中出现过的工具名，并对当前 tool_results 做去重。
 
-    直接访问 _data 属性避免 to_dict() 全量序列化。
-    返回 (history_tool_names, validated_tool_results)。
+    A2 不会像当前实现这样在本地强制修复 tool_use/tool_result 配对。
+    这里避免删除 history 中的 tool_use 或丢弃当前 tool_result，
+    以免长对话续接时把关键状态“修坏”。
     """
     tool_names: List[str] = []
     tool_names_seen: Set[str] = set()
-    all_tool_use_ids: Set[str] = set()
-    history_tool_result_ids: Set[str] = set()
 
     for msg in history:
         inner = msg._data
@@ -590,155 +605,62 @@ def _process_history_tools(
                     if tu.name and tu.name not in tool_names_seen:
                         tool_names.append(tu.name)
                         tool_names_seen.add(tu.name)
-                    if tu.tool_use_id:
-                        all_tool_use_ids.add(tu.tool_use_id)
-        elif isinstance(inner, HistoryUserMessage):
-            ctx = inner.user_input_message.user_input_message_context
-            if ctx.tool_results:
-                for tr in ctx.tool_results:
-                    if tr.tool_use_id:
-                        history_tool_result_ids.add(tr.tool_use_id)
 
-    # 验证 tool_use/tool_result 配对
-    unpaired = all_tool_use_ids - history_tool_result_ids
-
-    filtered: List[ToolResult] = []
-    for result in current_tool_results:
-        if result.tool_use_id in unpaired:
-            filtered.append(result)
-            unpaired.discard(result.tool_use_id)
-        elif result.tool_use_id in all_tool_use_ids:
-            logger.warning("跳过重复的 tool_result: tool_use_id=%s", result.tool_use_id)
-        else:
-            logger.warning("跳过孤立的 tool_result: tool_use_id=%s", result.tool_use_id)
-
-    # 移除孤立的 tool_use
-    if unpaired:
-        for oid in unpaired:
-            logger.warning("检测到孤立的 tool_use，将从历史中移除: tool_use_id=%s", oid)
-        for msg in history:
-            inner = msg._data
-            if not isinstance(inner, HistoryAssistantMessage):
-                continue
-            arm = inner.assistant_response_message
-            if not arm.tool_uses:
-                continue
-            arm.tool_uses = [tu for tu in arm.tool_uses if tu.tool_use_id not in unpaired]
-            if not arm.tool_uses:
-                arm.tool_uses = None
-
-    return tool_names, filtered
+    return tool_names, _dedupe_tool_results(current_tool_results)
 
 
 def _build_history(
     req: MessagesRequest, messages: List[AnthropicMessage], model_id: str,
 ) -> List[Message]:
-    """构建历史消息（system prompt 作为首对 user+assistant 注入）"""
+    """按 A2 风格构建 history。"""
     history: List[Message] = []
     thinking_prefix = _generate_thinking_prefix(req)
+    processed_messages = _merge_adjacent_messages(messages)
+    if not processed_messages:
+        return history
+    start_index = 0
 
-    # 1. 处理系统消息 → 注入为历史首对 user+assistant
     if req.system:
         system_content = "\n".join(
             s.get("text", "") for s in req.system if s.get("text")
         )
         if system_content:
-            system_content = f"{system_content}\n{SYSTEM_CHUNKED_POLICY}"
             if thinking_prefix and not _has_thinking_tags(system_content):
                 system_content = f"{thinking_prefix}\n{system_content}"
-            history.append(Message(HistoryUserMessage(
-                user_input_message=UserMessage.new(system_content, model_id),
-            )))
-            history.append(Message(HistoryAssistantMessage(
-                assistant_response_message=AssistantMessage.new("I will follow these instructions."),
-            )))
+            first_message = processed_messages[0]
+            if first_message.role == "user":
+                first_text, first_images, first_tool_results = _process_message_content(
+                    first_message.content,
+                    keep_images=True,
+                    image_placeholder=False,
+                    history_distance=len(processed_messages) - 1 if len(processed_messages) > 1 else None,
+                )
+                combined = f"{system_content}\n\n{first_text}" if first_text else system_content
+                first_user = UserMessage.new(combined, model_id)
+                if first_images:
+                    first_user.images = first_images
+                if first_tool_results:
+                    first_user.user_input_message_context = UserInputMessageContext(
+                        tool_results=_dedupe_tool_results(first_tool_results),
+                    )
+                history.append(Message(HistoryUserMessage(user_input_message=first_user)))
+                start_index = 1
+            else:
+                history.append(Message(HistoryUserMessage(
+                    user_input_message=UserMessage.new(system_content, model_id),
+                )))
     elif thinking_prefix:
-        # 没有 system 但有 thinking 配置
         history.append(Message(HistoryUserMessage(
             user_input_message=UserMessage.new(thinking_prefix, model_id),
         )))
-        history.append(Message(HistoryAssistantMessage(
-            assistant_response_message=AssistantMessage.new("I will follow these instructions."),
-        )))
-# PLACEHOLDER_CONVERTER_PART7
-
-    # 2. 处理常规消息历史（最后一条作为 currentMessage，不加入历史）
-    history_end = len(messages) - 1
-    user_buffer: List[Tuple[AnthropicMessage, int]] = []
-    assistant_buffer: List[AnthropicMessage] = []
-
-    for i in range(history_end):
-        msg = messages[i]
+    history_end = len(processed_messages) - 1
+    for i in range(start_index, history_end):
+        msg = processed_messages[i]
         history_distance = history_end - i
         if msg.role == "user":
-            # 先 flush assistant buffer
-            if assistant_buffer:
-                history.append(Message(_merge_assistant_messages(assistant_buffer)))
-                assistant_buffer = []
-            user_buffer.append((msg, history_distance))
+            history.append(_convert_history_user_message(msg, model_id, history_distance))
         elif msg.role == "assistant":
-            # 先 flush user buffer
-            if user_buffer:
-                texts: List[str] = []
-                images: List[KiroImage] = []
-                tool_results: List[ToolResult] = []
-                for user_msg, distance in user_buffer:
-                    keep_images = distance <= RECENT_HISTORY_WINDOW
-                    text, imgs, results = _process_message_content(
-                        user_msg.content,
-                        keep_images=keep_images,
-                        image_placeholder=not keep_images,
-                        history_distance=distance,
-                    )
-                    if text:
-                        texts.append(text)
-                    images.extend(imgs)
-                    tool_results.extend(results)
-                merged_content = "\n".join(part for part in texts if part)
-                merged = UserMessage.new(merged_content, model_id)
-                if images:
-                    merged.images = images
-                if tool_results:
-                    merged.user_input_message_context = UserInputMessageContext(
-                        tool_results=_dedupe_tool_results(tool_results),
-                    )
-                history.append(Message(HistoryUserMessage(user_input_message=merged)))
-                user_buffer = []
-            assistant_buffer.append(msg)
-
-    # flush 末尾 assistant buffer
-    if assistant_buffer:
-        history.append(Message(_merge_assistant_messages(assistant_buffer)))
-
-    # flush 末尾孤立 user buffer → 自动配对 "OK"
-    if user_buffer:
-        texts: List[str] = []
-        images: List[KiroImage] = []
-        tool_results: List[ToolResult] = []
-        for user_msg, distance in user_buffer:
-            keep_images = distance <= RECENT_HISTORY_WINDOW
-            text, imgs, results = _process_message_content(
-                user_msg.content,
-                keep_images=keep_images,
-                image_placeholder=not keep_images,
-                history_distance=distance,
-            )
-            if text:
-                texts.append(text)
-            images.extend(imgs)
-            tool_results.extend(results)
-        merged_content = "\n".join(part for part in texts if part)
-        merged = UserMessage.new(merged_content, model_id)
-        if images:
-            merged.images = images
-        if tool_results:
-            merged.user_input_message_context = UserInputMessageContext(
-                tool_results=_dedupe_tool_results(tool_results),
-            )
-        history.append(Message(HistoryUserMessage(user_input_message=merged)))
-        history.append(Message(HistoryAssistantMessage(
-            assistant_response_message=AssistantMessage.new(EMPTY_ASSISTANT_PLACEHOLDER),
-        )))
+            history.append(_convert_history_assistant_message(msg))
 
     return history
 
@@ -749,9 +671,10 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
     if model_id is None:
         raise UnsupportedModelError(req.model)
 
-    messages = req.get_messages()
-    if not messages:
+    raw_messages = req.get_messages()
+    if not raw_messages:
         raise EmptyMessagesError()
+    messages = _merge_adjacent_messages(raw_messages)
 
     last_message_is_assistant = messages[-1].role == "assistant"
     if last_message_is_assistant:
@@ -768,7 +691,7 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
     # 转换工具定义
     tools = _convert_tools(req.tools)
 
-    # 构建历史消息（system prompt 在此注入为首对 user+assistant）
+    # 构建历史消息
     history = _build_history(req, messages, model_id)
 
     if last_message_is_assistant:
@@ -796,12 +719,7 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
         if not current_text:
             current_text = CURRENT_MESSAGE_PLACEHOLDER if current_tool_results else CONTINUE_PLACEHOLDER
 
-    # 一次遍历：验证 tool pairing + 收集工具名 + 移除孤立 tool_use
-    history_tool_names, validated_tool_results = _process_history_tools(history, current_tool_results)
-    existing_names = {t.tool_specification.name.lower() for t in tools}
-    for tn in history_tool_names:
-        if tn.lower() not in existing_names:
-            tools.append(_create_placeholder_tool(tn))
+    validated_tool_results = _dedupe_tool_results(current_tool_results)
 
     # 构建 UserInputMessageContext
     context = UserInputMessageContext()
