@@ -169,6 +169,74 @@ export async function getRequestStats(): Promise<RequestStats> {
   return data
 }
 
+// Token 用量历史
+export async function getTokenUsageHistory(days: number = 7): Promise<{ history: Record<string, { input: number; output: number; models: Record<string, { input: number; output: number }> }> }> {
+  const { data } = await api.get('/token-usage/history', { params: { days } })
+  return data
+}
+
+// Token 小时级用量
+export async function getTokenUsageHourly(): Promise<{ hourly: Record<string, { input: number; output: number }> }> {
+  const { data } = await api.get('/token-usage/hourly')
+  return data
+}
+
+// ============ Claude Code 配置管理 ============
+
+export interface ClaudeSettings {
+  env?: Record<string, string>
+  permissions?: { defaultMode?: string }
+  model?: string
+  language?: string
+  alwaysThinkingEnabled?: boolean
+  skipDangerousModePermissionPrompt?: boolean
+  effortLevel?: string
+  enabledPlugins?: Record<string, boolean>
+  [key: string]: unknown
+}
+
+export interface ClaudeProfile {
+  filename: string
+  path: string
+  baseUrl: string
+  model: string
+  isActive: boolean
+}
+
+export interface ClaudeSession {
+  sessionId: string
+  project: string
+  firstPrompt: string
+  firstTimestamp: number
+  lastTimestamp: number
+  promptCount: number
+}
+
+export async function getClaudeSettings(): Promise<{ settings: ClaudeSettings; path: string; exists: boolean }> {
+  const { data } = await api.get('/claude/settings')
+  return data
+}
+
+export async function saveClaudeSettings(settings: ClaudeSettings): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/claude/settings', { settings })
+  return data
+}
+
+export async function getClaudeProfiles(): Promise<{ profiles: ClaudeProfile[] }> {
+  const { data } = await api.get('/claude/profiles')
+  return data
+}
+
+export async function switchClaudeProfile(filename: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/claude/profiles/switch', { filename })
+  return data
+}
+
+export async function getClaudeSessions(params?: { limit?: number; project?: string }): Promise<{ sessions: ClaudeSession[] }> {
+  const { data } = await api.get('/claude/sessions', { params })
+  return data
+}
+
 // 模型列表
 export async function getModelList(): Promise<ModelInfo[]> {
   const { data } = await api.get<{ models: ModelInfo[] }>('/models')
@@ -284,4 +352,87 @@ export async function updateAndRestart(
   } catch {
     return { success: false, message: '更新重启超时，请手动检查' }
   }
+}
+
+// ============ 多 API Key 管理 ============
+
+export interface ApiKeyEntry {
+  key: string
+  maskedKey: string
+  name: string
+  group: string
+  rate: number | null
+  monthlyQuota: number | null
+  effectiveRate: number
+  effectiveQuota: number
+  billedTokens: number
+  billedMonth: string
+  totalRawTokens: number
+  requestCount: number
+  enabled: boolean
+  createdAt: string
+  isAdmin?: boolean
+}
+
+export interface ApiKeyGroup {
+  rate: number
+  monthlyQuota: number
+}
+
+export async function getApiKeys(): Promise<{ keys: ApiKeyEntry[]; groups: Record<string, ApiKeyGroup> }> {
+  const { data } = await api.get('/keys')
+  return data
+}
+
+export async function addApiKey(req: { name: string; group: string; rate?: number | null; monthlyQuota?: number | null }): Promise<{ success: boolean; key: ApiKeyEntry }> {
+  const { data } = await api.post('/keys', req)
+  return data
+}
+
+export async function updateApiKey(key: string, fields: Partial<{ name: string; group: string; rate: number | null; monthlyQuota: number | null; enabled: boolean }>): Promise<{ success: boolean; key: ApiKeyEntry }> {
+  const { data } = await api.put(`/keys/${encodeURIComponent(key)}`, fields)
+  return data
+}
+
+export async function deleteApiKey(key: string): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/keys/${encodeURIComponent(key)}`)
+  return data
+}
+
+export async function regenerateApiKey(key: string): Promise<{ success: boolean; key: ApiKeyEntry }> {
+  const { data } = await api.post(`/keys/${encodeURIComponent(key)}/regenerate`)
+  return data
+}
+
+export async function resetApiKeyUsage(key: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/keys/${encodeURIComponent(key)}/reset`)
+  return data
+}
+
+export async function setApiKeyGroup(name: string, group: { rate: number; monthlyQuota: number }): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/keys/groups/${encodeURIComponent(name)}`, group)
+  return data
+}
+
+export async function deleteApiKeyGroup(name: string): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/keys/groups/${encodeURIComponent(name)}`)
+  return data
+}
+
+// Key 用量统计（不含 key 字符串，供首页展示）
+export interface KeyUsageStat {
+  name: string
+  group: string
+  modelCounts: Record<string, number>
+  modelTokens: Record<string, { input: number; output: number }>
+  dailyUsage: Record<string, { input: number; output: number }>
+  hourlyUsage: Record<string, { input: number; output: number }>
+  billedTokens: number
+  totalRawTokens: number
+  requestCount: number
+}
+
+export async function getKeyUsageStats(): Promise<{ keys: KeyUsageStat[]; groups: Record<string, ApiKeyGroup> }> {
+  const { data } = await api.get('/key-usage-stats')
+  return data
 }

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, field_validator
 
-MAX_BUDGET_TOKENS = 24576
+MAX_BUDGET_TOKENS = 128000  # Claude Code 对 Opus 等模型可发送高达 128K 的 thinking budget
 
 
 # === 错误响应 ===

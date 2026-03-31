@@ -5,6 +5,7 @@ import os
 import sys
 
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -26,6 +27,7 @@ from admin.runtime_log import init_runtime_log_buffer
 from plugin_loader import load_plugins, load_public_plugins, get_loaded_plugins
 from anthropic_api.message_log import init_message_logger
 from token_usage import init_token_usage_tracker
+from api_keys import init_api_key_manager
 import token_counter
 
 logging.basicConfig(
@@ -124,8 +126,33 @@ def main():
     # 初始化 token 用量追踪
     init_token_usage_tracker(token_manager.cache_dir())
 
+    # 初始化多 API Key 管理
+    init_api_key_manager(Path(__file__).resolve().parent)
+
+    # 挂载 Admin API（如果配置了非空的 admin_api_key）
+    admin_key = config.admin_api_key
+    admin_key_valid = bool(admin_key and admin_key.strip())
+    admin_service = None
+
+    # lifespan: 替代已废弃的 on_event("startup"/"shutdown")
+    @asynccontextmanager
+    async def lifespan(app):
+        # 不在启动时自动刷新余额，避免后台 heartbeat 触发上游 quota/balance 查询。
+        yield
+        if admin_service:
+            await admin_service.stop_auto_balance_refresh()
+        # 进程退出前强制落盘 token 用量
+        from token_usage import get_token_usage_tracker
+        tracker = get_token_usage_tracker()
+        if tracker:
+            tracker.flush()
+        from api_keys import get_api_key_manager
+        key_mgr = get_api_key_manager()
+        if key_mgr:
+            key_mgr.flush()
+
     # 构建 FastAPI 应用
-    app = FastAPI()
+    app = FastAPI(lifespan=lifespan)
 
     # 挂载 Anthropic API 路由
     anthropic_state = AppState(
@@ -142,26 +169,16 @@ def main():
     app.add_middleware(AuthMiddleware, state=anthropic_state)
     add_cors_middleware(app)
 
-    # 挂载 Admin API（如果配置了非空的 admin_api_key）
-    admin_key = config.admin_api_key
-    admin_key_valid = bool(admin_key and admin_key.strip())
-
     if admin_key and admin_key.strip():
         admin_service = AdminService(token_manager)
         app.state.admin_service = admin_service
-
-        @app.on_event("startup")
-        async def _start_admin_tasks():
-            admin_service.start_auto_balance_refresh()
-
-        @app.on_event("shutdown")
-        async def _stop_admin_tasks():
-            await admin_service.stop_auto_balance_refresh()
 
         admin_router = create_admin_router()
         admin_app = FastAPI()
         admin_app.include_router(admin_router)
         admin_app.state.admin_service = admin_service
+        admin_app.state.admin_api_key = admin_key
+        admin_app.state.proxy_api_key = api_key  # Claude 调用代理用的 key
 
         # 加载插件（路由注册到 admin_app，共享 admin 认证）
         loaded_plugins = load_plugins(admin_app)

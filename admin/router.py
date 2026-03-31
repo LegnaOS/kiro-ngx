@@ -3,15 +3,22 @@
 from fastapi import APIRouter
 
 from admin.handlers import (
-    add_credential, delete_credential, get_all_credentials,
+    add_api_key, add_credential, delete_api_key, delete_api_key_group,
+    delete_credential, get_all_credentials,
+    get_api_keys, get_key_usage_stats,
+    get_claude_profiles, get_claude_sessions, get_claude_settings,
     get_credential_balance, get_git_log, get_git_status,
     get_log_status, get_model_list, get_raw_credentials,
     get_request_stats, get_routing_config, get_runtime_logs, get_system_stats,
-    get_update_status, get_version_info, reset_all_counters,
-    reset_failure_count, restart_server, save_raw_credentials,
+    get_token_usage_history, get_token_usage_hourly, get_update_status, get_version_info,
+    regenerate_api_key, reset_all_counters, reset_api_key_usage,
+    reset_failure_count, restart_server, save_claude_settings,
+    save_raw_credentials,
+    set_api_key_group,
     set_credential_disabled, set_credential_group,
     set_credential_groups_batch, set_credential_priority,
-    set_log_status, set_routing_config, update_and_restart,
+    set_log_status, set_routing_config, switch_claude_profile,
+    update_and_restart, update_api_key,
 )
 
 
@@ -31,6 +38,8 @@ def create_admin_router() -> APIRouter:
     router.add_api_route("/credentials/{id}/balance", get_credential_balance, methods=["GET"])
     router.add_api_route("/credentials/{id}/group", set_credential_group, methods=["POST"])
     router.add_api_route("/stats", get_request_stats, methods=["GET"])
+    router.add_api_route("/token-usage/history", get_token_usage_history, methods=["GET"])
+    router.add_api_route("/token-usage/hourly", get_token_usage_hourly, methods=["GET"])
     router.add_api_route("/models", get_model_list, methods=["GET"])
     router.add_api_route("/routing", get_routing_config, methods=["GET"])
     router.add_api_route("/routing", set_routing_config, methods=["PUT"])
@@ -44,4 +53,19 @@ def create_admin_router() -> APIRouter:
     router.add_api_route("/update/status", get_update_status, methods=["GET"])
     router.add_api_route("/git/status", get_git_status, methods=["GET"])
     router.add_api_route("/git/log", get_git_log, methods=["GET"])
+    router.add_api_route("/claude/settings", get_claude_settings, methods=["GET"])
+    router.add_api_route("/claude/settings", save_claude_settings, methods=["PUT"])
+    router.add_api_route("/claude/profiles", get_claude_profiles, methods=["GET"])
+    router.add_api_route("/claude/profiles/switch", switch_claude_profile, methods=["POST"])
+    router.add_api_route("/claude/sessions", get_claude_sessions, methods=["GET"])
+    # 多 API Key 管理
+    router.add_api_route("/key-usage-stats", get_key_usage_stats, methods=["GET"])
+    router.add_api_route("/keys", get_api_keys, methods=["GET"])
+    router.add_api_route("/keys", add_api_key, methods=["POST"])
+    router.add_api_route("/keys/groups/{name}", set_api_key_group, methods=["PUT"])
+    router.add_api_route("/keys/groups/{name}", delete_api_key_group, methods=["DELETE"])
+    router.add_api_route("/keys/{key}/regenerate", regenerate_api_key, methods=["POST"])
+    router.add_api_route("/keys/{key}/reset", reset_api_key_usage, methods=["POST"])
+    router.add_api_route("/keys/{key}", update_api_key, methods=["PUT"])
+    router.add_api_route("/keys/{key}", delete_api_key, methods=["DELETE"])
     return router

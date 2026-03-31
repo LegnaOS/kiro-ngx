@@ -701,10 +701,14 @@ class MultiTokenManager:
                     self._current_id = best.id
 
     async def acquire_context(self, model: Optional[str] = None) -> CallContext:
-        """获取 API 调用上下文，自动刷新 Token 并支持故障转移"""
+        """获取 API 调用上下文，自动刷新 Token 并支持故障转移。
+        当所有凭据均处于临时冷却时，等待最近的冷却结束再重试，而非直接报错。
+        """
         total = self.total_count()
         tried_count = 0
+        max_cooldown_waits = 3  # 最多等待冷却 3 次，防止无限等
 
+        cooldown_waits = 0
         while True:
             if tried_count >= total:
                 raise RuntimeError(
@@ -718,7 +722,26 @@ class MultiTokenManager:
                     cid, cred = best
                     self._current_id = cid
                 else:
-                    raise RuntimeError(self._build_no_candidate_error(model, total))
+                    # 检查是否所有启用凭据都只是临时冷却（而非永久禁用）
+                    now = time.time()
+                    enabled = [e for e in self._entries if not e.disabled]
+                    cooled = [e for e in enabled if self._is_transiently_unavailable(e, now)]
+                    if cooled and len(cooled) == len(enabled) and cooldown_waits < max_cooldown_waits:
+                        nearest = min(e.transient_disabled_until for e in cooled)
+                        wait_secs = max(nearest - now, 0.1)
+                        wait_secs = min(wait_secs, 10.0)  # 单次最多等 10 秒
+                        cooldown_waits += 1
+                        logger.info(
+                            "所有启用凭据均处于临时冷却，等待 %.1fs 后重试（%d/%d）",
+                            wait_secs, cooldown_waits, max_cooldown_waits,
+                        )
+                    else:
+                        raise RuntimeError(self._build_no_candidate_error(model, total))
+
+            if not best:
+                # 在锁外 await
+                await asyncio.sleep(wait_secs)
+                continue
 
             # 尝试获取/刷新 Token
             try:

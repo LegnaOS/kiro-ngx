@@ -1,29 +1,31 @@
-# Kiro.py
+# kiro-ngx
 
-Kiro.rs 的 Python 复刻版，提供 Kiro IDE 凭据管理和 API 代理服务。
+基于 [kiro.rs](https://github.com/hank9999/kiro.rs) / [kiro.py](https://github.com/fruktoguo/kiro.py) 的增强版 Kiro IDE API 代理，专注**大上下文、低延迟、高稳定性**。
 
-## 功能
+## 相比上游的核心改进
 
-- Anthropic API 兼容代理（支持流式/非流式）
-- 多凭据管理与自动轮换
-- 负载均衡（优先级模式 / 均衡模式）
-- Token 自动刷新与过期管理
-- Admin Web UI（凭据管理、余额查询、批量导入、系统监控）
-- 一键远程更新部署
+| 特性 | 说明 |
+|------|------|
+| **1M 上下文窗口** | Claude 4.6 模型自动使用 1,000,000 token 上下文（上游 184K） |
+| **主动上下文压缩** | 60% 容量即开始三级渐进压缩，用户无感知：截断旧 tool_result → 截断旧 assistant → 丢弃最旧消息对 |
+| **结构安全裁剪** | 所有 history 裁剪都保证 user↔assistant 交替、orphaned tool_result 清理、消息对完整性 |
+| **TTFB 优化** | 移除热路径上的远程 token 计数（300s 超时），改用本地估算（~1ms） |
+| **HTTP/2 多路复用** | httpx + h2，减少 TCP 连接建立失败率 |
+| **连接错误不冷却凭据** | 网络抖动不再导致凭据进入冷却→全面不可用的死循环 |
+| **工具名 63 字符限制** | 自动 SHA256 缩短 + 流式响应反向映射，对客户端透明 |
 
 ## 快速开始
 
 ### 环境要求
 
 - Python 3.10+
-- Node.js 18+（构建前端）
-- Git
+- Node.js 18+（仅构建前端时需要）
 
 ### 安装
 
 ```bash
-git clone https://github.com/fruktoguo/kiro.py.git
-cd kiro.py
+git clone https://github.com/LegnaOS/kiro-ngx.git
+cd kiro-ngx
 ```
 
 ### 配置
@@ -43,34 +45,20 @@ cp credentials.example.json credentials.json
 | `kiroVersion` | Kiro IDE 版本号 | `0.10.0` |
 | `apiKey` | 代理 API Key（客户端调用时使用） | - |
 | `adminApiKey` | Admin UI 登录密钥 | - |
-| `loadBalancingMode` | 负载均衡模式：`priority` / `balanced` | `priority` |
+| `loadBalancingMode` | 负载均衡：`priority` / `balanced` | `priority` |
 
-编辑 `credentials.json`，填入凭据数组：
-
-```json
-[
-  {
-    "refreshToken": "your-refresh-token",
-    "authMethod": "social",
-    "clientId": "oidc-kiro",
-    "clientSecret": "your-client-secret",
-    "priority": 0,
-    "authRegion": "us-east-1",
-    "apiRegion": "us-east-1"
-  }
-]
-```
+编辑 `credentials.json`，填入凭据数组（参考 `credentials.example.json`）。
 
 ### 启动
 
-#### Linux（推荐）
+#### Linux / macOS（推荐）
 
 ```bash
 chmod +x deploy.sh
-./deploy.sh
+./deploy.sh          # 自动创建 venv、安装依赖、启动服务
+./deploy.sh --pull   # 同时拉取最新代码
+PORT=8991 ./deploy.sh
 ```
-
-`deploy.sh` 会自动创建 venv、安装依赖、构建前端、启动服务。
 
 #### 手动启动
 
@@ -78,79 +66,47 @@ chmod +x deploy.sh
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-
-cd admin-ui && npm install && npm run build && cd ..
-
 python main.py
 ```
 
 #### Windows
 
 ```bash
-pip install -r requirements.txt
-cd admin-ui && npm install && npm run build && cd ..
-python main.py
+restart.bat
 ```
 
-或使用 `restart.bat` 一键重启。
+### 使用
 
-## 使用
-
-### API 代理
-
-启动后，将客户端的 API 地址指向 `http://your-host:8990`，使用 `config.json` 中的 `apiKey` 作为认证密钥。
-
-### Admin UI
-
-浏览器访问 `http://your-host:8990/admin`，使用 `adminApiKey` 登录。
-
-功能：
-- 凭据列表：查看所有凭据状态、余额、调用次数
-- 批量导入：支持 JSON 格式批量导入，可选跳过验活
-- 编辑凭据文件：直接编辑 `credentials.json`
-- 负载均衡切换：优先级模式 / 均衡模式
-- 系统监控：CPU 和内存占用
-- 一键更新：从 GitHub 拉取最新代码并自动重新部署
-
-### 远程更新
-
-Admin UI 顶部栏会自动检查新版本。有更新时会显示版本号提示，点击即可一键更新（git pull + 构建 + 重启）。
-
-也可以手动更新：
-
-```bash
-cd kiro.py
-./deploy.sh
-```
+- **API 代理**：客户端 API 地址指向 `http://your-host:port`，使用 `config.json` 中的 `apiKey`
+- **Admin UI**：浏览器访问 `http://your-host:port/admin`，使用 `adminApiKey` 登录
 
 ## 项目结构
 
 ```
-kiro.py/
 ├── main.py                 # 入口
 ├── config.py               # 配置加载
-├── VERSION                 # 版本号
-├── admin/                  # Admin API
-│   ├── handlers.py         # 请求处理器
-│   ├── router.py           # 路由注册
-│   ├── service.py          # 业务逻辑
-│   └── ui_router.py        # 前端静态文件服务
+├── token_counter.py        # Token 计数（本地估算 + 远程 API）
+├── http_client.py          # httpx 客户端（HTTP/2 + transport 重试）
+├── deploy.sh / restart.bat # 一键部署
 ├── anthropic_api/          # Anthropic API 兼容层
-│   ├── converter.py        # 请求/响应转换
-│   ├── handlers.py         # API 处理器
-│   ├── stream.py           # 流式响应
+│   ├── converter.py        # Kiro ↔ Anthropic 请求转换
+│   ├── handlers.py         # 核心处理（压缩、裁剪、auto-continue）
+│   ├── stream.py           # 流式响应 + 工具名反向映射
 │   └── types.py            # 类型定义
 ├── kiro/                   # Kiro 核心
 │   ├── token_manager.py    # 多凭据管理与轮换
-│   ├── provider.py         # API 调用
-│   ├── machine_id.py       # Machine ID 生成
-│   ├── model/              # 数据模型
-│   └── parser/             # 事件流解析器
-├── admin-ui/               # 前端源码 (React + Vite)
-│   └── src/
-├── deploy.sh               # Linux 一键部署脚本
-└── restart.bat             # Windows 重启脚本
+│   ├── provider.py         # API 调用（连接错误隔离）
+│   └── parser/             # SSE 事件流解析
+├── admin/                  # Admin API + Web UI
+├── admin-ui/               # 前端（React + Vite + TailwindCSS）
+├── plugins/                # 插件
+└── tests/                  # 测试
 ```
+
+## 致谢
+
+- [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) — 原始 Rust 实现
+- [fruktoguo/kiro.py](https://github.com/fruktoguo/kiro.py) — Python 移植
 
 ## License
 

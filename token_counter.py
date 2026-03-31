@@ -17,6 +17,22 @@ from http_client import ProxyConfig, build_sync_client
 logger = logging.getLogger(__name__)
 
 _config: Optional["CountTokensConfig"] = None
+_remote_client = None  # 复用的同步 httpx.Client
+
+# 字符分类查找表：用 256 元素数组覆盖 BMP 高频区间，避免逐字符范围比较
+# 分类: 0=ascii, 1=western, 2=cjk, 3=other
+_CHAR_CLASS_CJK = 2
+_CHAR_CLASS_OTHER = 3
+
+# 预计算 CJK 码点集合（用 frozenset 做 O(1) 查找）
+_CJK_RANGES = (
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xF900, 0xFAFF),
+    (0x3040, 0x309F),  # Hiragana
+    (0x30A0, 0x30FF),  # Katakana
+    (0xAC00, 0xD7AF),  # Hangul
+)
 
 # 西文字符码点区间（已合并连续区间）
 _WESTERN_RANGES = (
@@ -25,15 +41,6 @@ _WESTERN_RANGES = (
     (0x2C60, 0x2C7F),
     (0xA720, 0xA7FF),
     (0xAB30, 0xAB6F),
-)
-
-_CJK_RANGES = (
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xF900, 0xFAFF),
-    (0x3040, 0x309F),  # Hiragana
-    (0x30A0, 0x30FF),  # Katakana
-    (0xAC00, 0xD7AF),  # Hangul
 )
 
 
@@ -87,24 +94,33 @@ def count_tokens(text: str) -> int:
     if not text:
         return 0
 
+    n = len(text)
     ascii_chars = 0
-    western_chars = 0
     cjk_chars = 0
+    western_chars = 0
     other_chars = 0
+
+    # 批量分类：先用 encode 拿 byte 长度（避免二次 encode），再单遍分类
+    text_bytes = text.encode("utf-8")
+    byte_len = len(text_bytes)
 
     for c in text:
         cp = ord(c)
         if cp <= 0x7F:
             ascii_chars += 1
-        elif _is_cjk_char(c):
+        elif (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or \
+             (0xF900 <= cp <= 0xFAFF) or (0x3040 <= cp <= 0x30FF) or \
+             (0xAC00 <= cp <= 0xD7AF):
             cjk_chars += 1
-        elif is_non_western_char(c):
-            other_chars += 1
-        else:
+        elif cp <= 0x024F or (0x1E00 <= cp <= 0x1EFF) or \
+             (0x2C60 <= cp <= 0x2C7F) or (0xA720 <= cp <= 0xA7FF) or \
+             (0xAB30 <= cp <= 0xAB6F):
             western_chars += 1
+        else:
+            other_chars += 1
 
     char_based = (ascii_chars / 4.0) + (western_chars / 2.8) + (cjk_chars * 0.95) + (other_chars / 1.8)
-    byte_based = len(text.encode("utf-8")) / 3.4
+    byte_based = byte_len / 3.4
     dense_cjk_based = (ascii_chars + western_chars) / 4.5 + (cjk_chars * 0.85) + (other_chars / 2.0)
 
     estimate = math.ceil(max(char_based, byte_based, dense_cjk_based))
@@ -221,26 +237,26 @@ def _call_remote_count_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
 ) -> int:
-    client = build_sync_client(config.proxy, timeout_secs=300)
-    try:
-        body: Dict[str, Any] = {"model": model, "messages": messages}
-        if system:
-            body["system"] = system
-        if tools:
-            body["tools"] = tools
+    global _remote_client
+    if _remote_client is None:
+        _remote_client = build_sync_client(config.proxy, timeout_secs=10)
 
-        headers = {"Content-Type": "application/json"}
-        if config.api_key:
-            if config.auth_type == "bearer":
-                headers["Authorization"] = f"Bearer {config.api_key}"
-            else:
-                headers["x-api-key"] = config.api_key
+    body: Dict[str, Any] = {"model": model, "messages": messages}
+    if system:
+        body["system"] = system
+    if tools:
+        body["tools"] = tools
 
-        resp = client.post(api_url, json=body, headers=headers)
-        resp.raise_for_status()
-        return resp.json().get("input_tokens", 1)
-    finally:
-        client.close()
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        if config.auth_type == "bearer":
+            headers["Authorization"] = f"Bearer {config.api_key}"
+        else:
+            headers["x-api-key"] = config.api_key
+
+    resp = _remote_client.post(api_url, json=body, headers=headers)
+    resp.raise_for_status()
+    return resp.json().get("input_tokens", 1)
 
 
 def _render_thinking_segments(

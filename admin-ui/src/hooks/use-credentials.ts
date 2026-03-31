@@ -11,12 +11,19 @@ import {
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
+interface UseCredentialsOptions {
+  enabled?: boolean
+  refetchInterval?: number | false
+}
+
 // 查询凭据列表
-export function useCredentials() {
+export function useCredentials(options?: UseCredentialsOptions) {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 3000,
+    enabled: options?.enabled ?? true,
+    refetchInterval: options?.refetchInterval ?? false,
+    refetchIntervalInBackground: false,
   })
 }
 

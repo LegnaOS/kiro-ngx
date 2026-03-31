@@ -24,9 +24,10 @@ from kiro.model.credentials import KiroCredentials
 
 logger = logging.getLogger(__name__)
 
-# 余额缓存过期时间（秒）
-BALANCE_CACHE_TTL_SECS = 300
-AUTO_BALANCE_REFRESH_INTERVAL_SECS = 600
+# 余额缓存过期时间（秒）—— 设长一点，避免频繁穿透到上游 getUsageLimits
+BALANCE_CACHE_TTL_SECS = 1800
+# 后台自动余额刷新间隔（秒）—— 太频繁会触发上游闲置检测
+AUTO_BALANCE_REFRESH_INTERVAL_SECS = 3600
 
 
 class AdminService:

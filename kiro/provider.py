@@ -236,7 +236,11 @@ class KiroProvider:
                     raise RuntimeError(f"{api_type} API 连接池等待超时: {e}")
                 logger.warning("API 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e
-                self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
+                # 连接错误（ConnectError/ConnectTimeout）是网络层问题，不冷却凭据
+                # 只有 API 层错误（4xx/5xx）才应该冷却凭据
+                is_connect_error = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))
+                if not is_connect_error:
+                    self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
                 if attempt + 1 < max_retries:
                     await asyncio.sleep(self.retry_delay(attempt))
                 continue
@@ -334,7 +338,9 @@ class KiroProvider:
                     raise RuntimeError(f"MCP 连接池等待超时: {e}")
                 logger.warning("MCP 请求发送失败（尝试 %d/%d）: %s", attempt + 1, max_retries, e)
                 last_error = e
-                self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
+                is_connect_error = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))
+                if not is_connect_error:
+                    self._token_manager.report_transient_failure(ctx.id, cooldown_secs=max(2, int(self.retry_delay(attempt) * 2)))
                 if attempt + 1 < max_retries:
                     await asyncio.sleep(self.retry_delay(attempt))
                 continue

@@ -220,7 +220,8 @@ def _get_process_memory_mb() -> float:
     """获取当前进程内存占用（MB），跨平台"""
     pid = os.getpid()
     try:
-        if platform.system() == "Windows":
+        system = platform.system()
+        if system == "Windows":
             import ctypes
             from ctypes import wintypes
 
@@ -248,6 +249,14 @@ def _get_process_memory_mb() -> float:
                     kernel32.CloseHandle(handle)
                     return counters.WorkingSetSize / (1024 * 1024)
                 kernel32.CloseHandle(handle)
+        elif system == "Darwin":
+            import subprocess
+            r = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return int(r.stdout.strip()) / 1024  # KB → MB
         else:
             with open(f"/proc/{pid}/status") as f:
                 for line in f:
@@ -377,7 +386,8 @@ def _get_memory_breakdown(limit: int = _MEMORY_BREAKDOWN_TOP_N) -> tuple[list[di
 def _get_cpu_percent() -> float:
     """获取系统 CPU 使用率，跨平台"""
     try:
-        if platform.system() == "Windows":
+        system = platform.system()
+        if system == "Windows":
             import ctypes
 
             class FILETIME(ctypes.Structure):
@@ -403,6 +413,20 @@ def _get_cpu_percent() -> float:
             if total_d == 0:
                 return 0.0
             return round((1.0 - idle_d / total_d) * 100, 1)
+        elif system == "Darwin":
+            import subprocess
+            r = subprocess.run(
+                ["top", "-l", "1", "-n", "0", "-s", "0"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.split("\n"):
+                    if "CPU usage" in line:
+                        # "CPU usage: 5.26% user, 10.52% sys, 84.21% idle"
+                        for part in line.split(","):
+                            if "idle" in part:
+                                idle_pct = float(part.strip().split("%")[0].strip().split()[-1])
+                                return round(100.0 - idle_pct, 1)
         else:
             def read_cpu():
                 with open("/proc/stat") as f:
@@ -772,6 +796,25 @@ async def get_request_stats(request: Request) -> JSONResponse:
     return JSONResponse(content=stats)
 
 
+async def get_token_usage_history(request: Request) -> JSONResponse:
+    """GET /token-usage/history - 获取历史 token 用量"""
+    from token_usage import get_token_usage_tracker
+    days = int(request.query_params.get("days", "7"))
+    tracker = get_token_usage_tracker()
+    if not tracker:
+        return JSONResponse(content={"history": {}})
+    return JSONResponse(content={"history": tracker.get_history(days)})
+
+
+async def get_token_usage_hourly(request: Request) -> JSONResponse:
+    """GET /token-usage/hourly - 获取今日小时级用量"""
+    from token_usage import get_token_usage_tracker
+    tracker = get_token_usage_tracker()
+    if not tracker:
+        return JSONResponse(content={"hourly": {}})
+    return JSONResponse(content={"hourly": tracker.get_hourly()})
+
+
 async def get_model_list(request: Request) -> JSONResponse:
     """GET /models - 获取支持的模型列表（内置 + 自定义）"""
     from anthropic_api.handlers import MODELS
@@ -863,3 +906,277 @@ async def get_runtime_logs(request: Request) -> JSONResponse:
     else:
         result = buf.tail(limit=limit, level=level, keyword=keyword)
     return JSONResponse(content=result)
+
+
+# ============ Claude Code 配置管理 ============
+
+def _claude_home() -> Path:
+    """跨平台获取 ~/.claude 目录"""
+    if platform.system() == "Windows":
+        return Path(os.environ.get("USERPROFILE", "~")) / ".claude"
+    return Path.home() / ".claude"
+
+
+async def get_claude_settings(request: Request) -> JSONResponse:
+    """GET /claude/settings - 读取 Claude Code settings.json"""
+    settings_path = _claude_home() / "settings.json"
+    if not settings_path.exists():
+        return JSONResponse(content={"settings": {}, "path": str(settings_path), "exists": False})
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": f"读取失败: {e}"})
+    return JSONResponse(content={"settings": data, "path": str(settings_path), "exists": True})
+
+
+async def save_claude_settings(request: Request) -> JSONResponse:
+    """PUT /claude/settings - 写入 Claude Code settings.json"""
+    settings_path = _claude_home() / "settings.json"
+    body = await request.json()
+    settings = body.get("settings")
+    if not isinstance(settings, dict):
+        return JSONResponse(status_code=400, content={"success": False, "message": "settings 必须是 JSON 对象"})
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": f"写入失败: {e}"})
+    return JSONResponse(content={"success": True, "message": "已保存"})
+
+
+async def get_claude_profiles(request: Request) -> JSONResponse:
+    """GET /claude/profiles - 列出所有 settings 配置文件（含备用配置）"""
+    claude_dir = _claude_home()
+    profiles: list[dict] = []
+    if not claude_dir.exists():
+        return JSONResponse(content={"profiles": profiles})
+    for f in sorted(claude_dir.iterdir()):
+        if f.suffix == ".json" and "settings" in f.name.lower():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                base_url = data.get("env", {}).get("ANTHROPIC_BASE_URL", "")
+                model = data.get("model", "")
+                profiles.append({
+                    "filename": f.name,
+                    "path": str(f),
+                    "baseUrl": base_url,
+                    "model": model,
+                    "isActive": f.name == "settings.json",
+                })
+            except Exception:
+                profiles.append({"filename": f.name, "path": str(f), "baseUrl": "", "model": "", "isActive": False})
+    return JSONResponse(content={"profiles": profiles})
+
+
+async def switch_claude_profile(request: Request) -> JSONResponse:
+    """POST /claude/profiles/switch - 切换配置文件（交换 settings.json 与目标文件）"""
+    body = await request.json()
+    target = body.get("filename", "")
+    if not target or target == "settings.json":
+        return JSONResponse(status_code=400, content={"success": False, "message": "无效的目标文件"})
+    claude_dir = _claude_home()
+    active_path = claude_dir / "settings.json"
+    target_path = claude_dir / target
+    if not target_path.exists():
+        return JSONResponse(status_code=404, content={"success": False, "message": f"文件不存在: {target}"})
+    # 把当前 settings.json 备份为 settings-backup.json，再把目标复制过来
+    try:
+        if active_path.exists():
+            # 生成备份名：settings-{原目标去掉前缀}.json 或 settings-prev.json
+            backup_name = f"settings-prev.json"
+            backup_path = claude_dir / backup_name
+            # 如果 backup 已存在，覆盖
+            import shutil
+            shutil.copy2(str(active_path), str(backup_path))
+        shutil.copy2(str(target_path), str(active_path))
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": f"切换失败: {e}"})
+    return JSONResponse(content={"success": True, "message": f"已切换到 {target}"})
+
+
+async def get_claude_sessions(request: Request) -> JSONResponse:
+    """GET /claude/sessions - 读取 Claude Code 会话列表"""
+    history_path = _claude_home() / "history.jsonl"
+    if not history_path.exists():
+        return JSONResponse(content={"sessions": []})
+
+    limit = int(request.query_params.get("limit", "50"))
+    project_filter = request.query_params.get("project", "")
+
+    sessions_map: dict[str, dict] = {}
+    try:
+        for line in history_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            sid = entry.get("sessionId", "")
+            if not sid:
+                continue
+            project = entry.get("project", "")
+            if project_filter and project_filter not in project:
+                continue
+            ts = entry.get("timestamp", 0)
+            if sid not in sessions_map or ts > sessions_map[sid].get("lastTimestamp", 0):
+                if sid not in sessions_map:
+                    sessions_map[sid] = {
+                        "sessionId": sid,
+                        "project": project,
+                        "firstPrompt": entry.get("display", ""),
+                        "firstTimestamp": ts,
+                        "lastTimestamp": ts,
+                        "promptCount": 0,
+                    }
+                sessions_map[sid]["lastTimestamp"] = max(sessions_map[sid]["lastTimestamp"], ts)
+                sessions_map[sid]["promptCount"] += 1
+            else:
+                sessions_map[sid]["promptCount"] += 1
+                sessions_map[sid]["lastTimestamp"] = max(sessions_map[sid]["lastTimestamp"], ts)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": f"读取失败: {e}"})
+
+    # 按最后活跃时间倒序
+    sessions = sorted(sessions_map.values(), key=lambda s: s["lastTimestamp"], reverse=True)[:limit]
+    return JSONResponse(content={"sessions": sessions})
+
+
+# ============ 多 API Key 管理 ============
+
+def _get_key_mgr():
+    from api_keys import get_api_key_manager
+    return get_api_key_manager()
+
+
+async def get_api_keys(request: Request) -> JSONResponse:
+    """GET /keys"""
+    mgr = _get_key_mgr()
+    keys = mgr.get_all_keys() if mgr else []
+    groups = mgr.get_groups() if mgr else {}
+
+    # 把代理主 Key（Claude 使用的 apiKey）作为管理员条目插入列表头部
+    proxy_key = getattr(request.app.state, "proxy_api_key", None)
+    if proxy_key:
+        masked = proxy_key[:7] + "..." + proxy_key[-4:] if len(proxy_key) > 12 else proxy_key
+        keys.insert(0, {
+            "key": proxy_key,
+            "maskedKey": masked,
+            "name": "管理员",
+            "group": "admin",
+            "rate": None,
+            "monthlyQuota": None,
+            "effectiveRate": 0,
+            "effectiveQuota": -1,
+            "billedTokens": 0,
+            "billedMonth": "",
+            "totalRawTokens": 0,
+            "requestCount": 0,
+            "enabled": True,
+            "createdAt": "",
+            "isAdmin": True,
+        })
+
+    return JSONResponse(content={"keys": keys, "groups": groups})
+
+
+async def add_api_key(request: Request) -> JSONResponse:
+    """POST /keys"""
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(status_code=503, content={"success": False, "message": "Key manager not initialized"})
+    body = await request.json()
+    name = body.get("name", "").strip()
+    group = body.get("group", "").strip()
+    if not name:
+        return JSONResponse(status_code=400, content={"success": False, "message": "name is required"})
+    entry = mgr.add_key(
+        name=name,
+        group=group,
+        rate=body.get("rate"),
+        monthly_quota=body.get("monthlyQuota"),
+    )
+    return JSONResponse(content={"success": True, "key": entry})
+
+
+async def update_api_key(request: Request) -> JSONResponse:
+    """PUT /keys/{key}"""
+    key_str = request.path_params["key"]
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(status_code=503, content={"success": False, "message": "Key manager not initialized"})
+    body = await request.json()
+    result = mgr.update_key(key_str, **{k: v for k, v in body.items() if k in ("name", "group", "rate", "monthlyQuota", "enabled")})
+    if not result:
+        return JSONResponse(status_code=404, content={"success": False, "message": "Key not found"})
+    return JSONResponse(content={"success": True, "key": result})
+
+
+async def delete_api_key(request: Request) -> JSONResponse:
+    """DELETE /keys/{key}"""
+    key_str = request.path_params["key"]
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(status_code=503, content={"success": False, "message": "Key manager not initialized"})
+    if not mgr.delete_key(key_str):
+        return JSONResponse(status_code=404, content={"success": False, "message": "Key not found"})
+    return JSONResponse(content={"success": True})
+
+
+async def regenerate_api_key(request: Request) -> JSONResponse:
+    """POST /keys/{key}/regenerate"""
+    key_str = request.path_params["key"]
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(status_code=503, content={"success": False, "message": "Key manager not initialized"})
+    result = mgr.regenerate_key(key_str)
+    if not result:
+        return JSONResponse(status_code=404, content={"success": False, "message": "Key not found"})
+    return JSONResponse(content={"success": True, "key": result})
+
+
+async def reset_api_key_usage(request: Request) -> JSONResponse:
+    """POST /keys/{key}/reset"""
+    key_str = request.path_params["key"]
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(status_code=503, content={"success": False, "message": "Key manager not initialized"})
+    if not mgr.reset_usage(key_str):
+        return JSONResponse(status_code=404, content={"success": False, "message": "Key not found"})
+    return JSONResponse(content={"success": True})
+
+
+async def set_api_key_group(request: Request) -> JSONResponse:
+    """PUT /keys/groups/{name}"""
+    name = request.path_params["name"]
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(status_code=503, content={"success": False, "message": "Key manager not initialized"})
+    body = await request.json()
+    rate = body.get("rate", 1.0)
+    monthly_quota = body.get("monthlyQuota", -1)
+    mgr.set_group(name, rate, monthly_quota)
+    return JSONResponse(content={"success": True})
+
+
+async def delete_api_key_group(request: Request) -> JSONResponse:
+    """DELETE /keys/groups/{name}"""
+    name = request.path_params["name"]
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(status_code=503, content={"success": False, "message": "Key manager not initialized"})
+    if not mgr.delete_group(name):
+        return JSONResponse(status_code=400, content={"success": False, "message": "Group not found or still in use"})
+    return JSONResponse(content={"success": True})
+
+
+async def get_key_usage_stats(request: Request) -> JSONResponse:
+    """GET /keys/usage-stats - 获取所有 key 的用量统计（不含 key 字符串）"""
+    mgr = _get_key_mgr()
+    if not mgr:
+        return JSONResponse(content={"keys": [], "groups": {}})
+    return JSONResponse(content={
+        "keys": mgr.get_usage_stats(),
+        "groups": mgr.get_groups(),
+    })

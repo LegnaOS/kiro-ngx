@@ -74,7 +74,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [regions, setRegions] = useState<string[]>(loadRegions)
   const [newRegion, setNewRegion] = useState('')
 
-  const { data: existingCredentials } = useCredentials()
+  const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
 

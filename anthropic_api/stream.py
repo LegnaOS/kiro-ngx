@@ -14,7 +14,13 @@ logger = logging.getLogger(__name__)
 # 需要跳过的包裹字符（当 thinking 标签被这些字符包裹时，认为是引用而非真正标签）
 QUOTE_CHARS = {ord(c) for c in '`"\'\\#!@$%^&*()-_=+[]{};:<>,.?/'}
 
-CONTEXT_WINDOW_SIZE = 200_000
+CONTEXT_WINDOW_SIZE = 200_000  # 默认值，实际使用 get_context_window_size(model) 动态确定
+
+
+def _get_model_context_window(model: str) -> int:
+    """根据模型返回上下文窗口大小"""
+    from .converter import get_context_window_size
+    return get_context_window_size(model)
 
 
 class IncompleteToolUseError(RuntimeError):
@@ -208,9 +214,11 @@ def estimate_tokens(text: str) -> int:
 class StreamContext:
     """流处理上下文 - 处理 Kiro 事件并转换为 Anthropic SSE 事件"""
 
-    def __init__(self, model: str, input_tokens: int, thinking_enabled: bool = False):
+    def __init__(self, model: str, input_tokens: int, thinking_enabled: bool = False,
+                 tool_name_map: Optional[Dict[str, str]] = None):
         self.state_manager = SseStateManager()
         self.model = model
+        self.context_window_size = _get_model_context_window(model)
         self.message_id = f"msg_{uuid.uuid4().hex}"
         self.input_tokens = input_tokens
         self.context_input_tokens: Optional[int] = None
@@ -229,6 +237,9 @@ class StreamContext:
         self._tool_json_buffers: Dict[str, str] = {}  # tool_use_id → 累积的 JSON 字符串
         self._tool_names: Dict[str, str] = {}  # tool_use_id -> 最近一次观察到的工具名
         self._last_assistant_content: Optional[str] = None
+        # short → original 反向映射，用于将 Kiro 返回的缩短名称还原
+        # short → original 反向映射表
+        self._tool_name_reverse_map: Dict[str, str] = dict(tool_name_map) if tool_name_map else {}
 
     @property
     def accumulated_text(self) -> str:
@@ -289,7 +300,7 @@ class StreamContext:
                 return []
         elif isinstance(event, ContextUsageEvent):
             self._last_assistant_content = None
-            actual = int(event.context_usage_percentage * CONTEXT_WINDOW_SIZE / 100.0)
+            actual = int(event.context_usage_percentage * self.context_window_size / 100.0)
             self.context_total_tokens = actual
             if event.context_usage_percentage >= 100.0:
                 self.state_manager.set_stop_reason("model_context_window_exceeded")
@@ -471,12 +482,15 @@ class StreamContext:
                 block_index = self.state_manager.next_block_index()
                 self.tool_block_indices[tool_use.tool_use_id] = block_index
 
+            # 反向映射工具名称（Kiro 返回缩短名 → 原始名）
+            output_name = self._tool_name_reverse_map.get(tool_use.name, tool_use.name)
+
             # content_block_start
             events.extend(self.state_manager.handle_content_block_start(block_index, "tool_use", {
                 "type": "content_block_start", "index": block_index,
                 "content_block": {
                     "type": "tool_use", "id": tool_use.tool_use_id,
-                    "name": tool_use.name, "input": {},
+                    "name": output_name, "input": {},
                 },
             }))
 
@@ -560,11 +574,12 @@ class StreamContext:
                 if block_index is None:
                     block_index = self.state_manager.next_block_index()
                     self.tool_block_indices[tid] = block_index
+                output_name = self._tool_name_reverse_map.get(tool_name, tool_name)
                 events.extend(self.state_manager.handle_content_block_start(block_index, "tool_use", {
                     "type": "content_block_start", "index": block_index,
                     "content_block": {
                         "type": "tool_use", "id": tid,
-                        "name": tool_name, "input": {},
+                        "name": output_name, "input": {},
                     },
                 }))
                 if final_input:
@@ -597,8 +612,9 @@ class BufferedStreamContext:
     缓冲所有事件直到流结束，然后用 contextUsageEvent 的正确 input_tokens 更正 message_start。
     """
 
-    def __init__(self, model: str, estimated_input_tokens: int, thinking_enabled: bool = False):
-        self.inner = StreamContext(model, estimated_input_tokens, thinking_enabled)
+    def __init__(self, model: str, estimated_input_tokens: int, thinking_enabled: bool = False,
+                 tool_name_map: Optional[Dict[str, str]] = None):
+        self.inner = StreamContext(model, estimated_input_tokens, thinking_enabled, tool_name_map)
         self.event_buffer: List[SseEvent] = []
         self.estimated_input_tokens = estimated_input_tokens
         self._initial_events_generated = False
