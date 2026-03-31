@@ -1,81 +1,97 @@
 @echo off
-chcp 65001 >nul
+setlocal enabledelayedexpansion
+chcp 65001 >nul 2>&1
 cd /d "%~dp0"
 
-echo === Kiro.py 一键部署 ===
+echo === kiro-ngx deploy ===
 
-:: 可选：传 --pull 参数时拉取代码
+:: Step 1: optional git pull
 if "%~1"=="--pull" (
-    echo [1/3] 拉取最新代码...
+    echo [1/3] Pulling latest code...
     git fetch origin
-    git pull --ff-only 2>nul || echo   ff-only 失败，存在本地改动，跳过拉取
+    git pull --ff-only 2>nul || echo   ff-only failed, local changes exist, skipping pull
 ) else (
-    echo [1/3] 跳过代码拉取（传 --pull 参数可启用）
+    echo [1/3] Skipping code pull (pass --pull to enable)
 )
 
-:: venv 不存在时自动创建
+:: Step 2: venv
 if not exist "venv\Scripts\activate.bat" (
-    echo [2/3] 创建虚拟环境...
+    echo [2/3] Creating virtual environment...
     if exist venv rmdir /s /q venv
     python -m venv venv
+    if errorlevel 1 (
+        echo ERROR: Failed to create venv. Is Python 3.10+ installed?
+        goto :eof
+    )
 ) else (
-    echo [2/3] 虚拟环境已存在
+    echo [2/3] Virtual environment exists
 )
 call venv\Scripts\activate.bat
 pip install -q -r requirements.txt
 
-:: 启动服务
-echo [3/3] 启动服务...
-set TARGET_PORT=8991
-if defined PORT set TARGET_PORT=%PORT%
-set PID_FILE=.kiro.pid
+:: Step 3: start service
+echo [3/3] Starting service...
+set "TARGET_PORT=8991"
+if defined PORT set "TARGET_PORT=%PORT%"
+set "PID_FILE=.kiro.pid"
 
-:: 先尝试 PID 文件
-set OLD_PID=
+:: Read old PID from file
+set "OLD_PID="
 if exist "%PID_FILE%" (
     set /p OLD_PID=<"%PID_FILE%"
 )
 
-:: PID 文件无效时按端口查找 LISTENING 进程
-if "%OLD_PID%"=="" (
-    for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%TARGET_PORT% " ^| findstr "LISTENING"') do (
-        set OLD_PID=%%a
+:: If no PID file, find by listening port
+if "!OLD_PID!"=="" (
+    for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":!TARGET_PORT! " ^| findstr "LISTENING"') do (
+        set "OLD_PID=%%a"
     )
 )
 
-:: 停止旧进程
-if not "%OLD_PID%"=="" (
-    echo 停止旧进程 (PID: %OLD_PID%)...
-    taskkill /PID %OLD_PID% /F >nul 2>&1
-    :: 等待进程退出，最多 5 秒
-    for /l %%i in (1,1,10) do (
-        tasklist /FI "PID eq %OLD_PID%" 2>nul | findstr "%OLD_PID%" >nul 2>&1 || goto :stopped
-        timeout /t 1 /nobreak >nul
-    )
-    :stopped
+:: Kill old process
+if not "!OLD_PID!"=="" (
+    echo Stopping old process (PID: !OLD_PID!)...
+    taskkill /PID !OLD_PID! /F >nul 2>&1
+    :: Wait up to 5s for process to exit
+    set "_wait=0"
+    :wait_loop
+    if !_wait! GEQ 10 goto :stopped
+    tasklist /FI "PID eq !OLD_PID!" 2>nul | findstr "!OLD_PID!" >nul 2>&1
+    if errorlevel 1 goto :stopped
+    timeout /t 1 /nobreak >nul
+    set /a _wait+=1
+    goto :wait_loop
 )
+:stopped
 
-:: 后台启动服务
+:: Launch in background
 start "" /b cmd /c "venv\Scripts\python main.py > kiro.log 2>&1"
 
-:: 获取新进程 PID 并写入 PID 文件
-timeout /t 1 /nobreak >nul
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%TARGET_PORT% " ^| findstr "LISTENING"') do (
+:: Wait and capture new PID
+timeout /t 2 /nobreak >nul
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":!TARGET_PORT! " ^| findstr "LISTENING"') do (
     echo %%a> "%PID_FILE%"
-    echo 服务已启动 (PID: %%a), 日志: kiro.log
+    echo Service started (PID: %%a), log: kiro.log
     goto :healthcheck
 )
-echo 服务已启动, 日志: kiro.log
+echo Service started, log: kiro.log
 
 :healthcheck
-:: 健康检查：等待端口就绪
-for /l %%i in (1,1,10) do (
-    timeout /t 1 /nobreak >nul
-    netstat -ano | findstr ":%TARGET_PORT% " | findstr "LISTENING" >nul 2>&1 && (
-        echo 端口 %TARGET_PORT% 已就绪
-        goto :done
-    )
+:: Health check: wait for port
+set "_hc=0"
+:hc_loop
+if !_hc! GEQ 10 goto :hc_timeout
+timeout /t 1 /nobreak >nul
+netstat -ano 2>nul | findstr ":!TARGET_PORT! " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 (
+    echo Port !TARGET_PORT! is ready
+    goto :done
 )
-echo 警告: 端口 %TARGET_PORT% 在 10 秒内未就绪，请检查 kiro.log
+set /a _hc+=1
+goto :hc_loop
+
+:hc_timeout
+echo WARNING: Port !TARGET_PORT! not ready after 10s, check kiro.log
 
 :done
+endlocal
