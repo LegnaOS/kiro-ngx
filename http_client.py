@@ -10,7 +10,7 @@ import httpx
 DEFAULT_LIMITS = httpx.Limits(
     max_keepalive_connections=200,
     max_connections=400,
-    keepalive_expiry=120.0,
+    keepalive_expiry=30.0,  # 降低空闲连接保持时间，避免复用被上游关闭的 stale TLS 连接
 )
 DEFAULT_POOL_TIMEOUT_SECS = 8.0
 DEFAULT_CONNECT_TIMEOUT_SECS = 30.0
