@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, field_validator
 
-MAX_BUDGET_TOKENS = 51200  # 50K thinking budget，平衡质量与token消耗
+MAX_BUDGET_TOKENS = 0  # 不限制，透传客户端原始 budget_tokens
 
 
 # === 错误响应 ===
@@ -69,7 +69,7 @@ class Thinking:
     budget_tokens: int = 20000
 
     def __post_init__(self):
-        self.budget_tokens = min(self.budget_tokens, MAX_BUDGET_TOKENS)
+        pass  # 不限制 budget_tokens，透传客户端原始值
 
     def is_enabled(self) -> bool:
         return self.type in ("enabled", "adaptive")
@@ -162,7 +162,7 @@ class MessagesRequest(BaseModel):
             return None
         return Thinking(
             type=self.thinking.get("type", "disabled"),
-            budget_tokens=min(self.thinking.get("budget_tokens", 20000), MAX_BUDGET_TOKENS),
+            budget_tokens=self.thinking.get("budget_tokens", 20000),
         )
 
     def get_output_config(self) -> Optional[OutputConfig]:
