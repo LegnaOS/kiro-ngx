@@ -569,6 +569,9 @@ class StreamContext:
                     "检测到未完成 tool_use，按 A2 风格收尾输出: tool_use_id=%s, name=%s, pending_input_len=%d",
                     tid, tool_name, pending_len,
                 )
+                # 尝试修复不完整的 JSON
+                if final_input:
+                    final_input = _repair_partial_json(final_input)
                 self.state_manager.set_has_tool_use(True)
                 block_index = self.tool_block_indices.get(tid)
                 if block_index is None:
@@ -648,3 +651,48 @@ class BufferedStreamContext:
         result = self.event_buffer
         self.event_buffer = []
         return result
+
+
+def _repair_partial_json(s: str) -> str:
+    """尝试修复不完整的 JSON 字符串（未完成的 tool_use input）。
+    补齐缺失的引号和花括号/方括号。"""
+    if not s:
+        return "{}"
+    try:
+        json.loads(s)
+        return s
+    except Exception:
+        pass
+    in_string = False
+    escape_next = False
+    braces = 0
+    brackets = 0
+    for ch in s:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if ch == '{':
+                braces += 1
+            elif ch == '}':
+                braces -= 1
+            elif ch == '[':
+                brackets += 1
+            elif ch == ']':
+                brackets -= 1
+    result = s
+    if in_string:
+        result += '"'
+    result += ']' * max(brackets, 0)
+    result += '}' * max(braces, 0)
+    try:
+        json.loads(result)
+        return result
+    except Exception:
+        return "{}"
