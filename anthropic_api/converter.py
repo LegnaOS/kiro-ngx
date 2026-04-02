@@ -408,10 +408,17 @@ TOOL_NAME_MAX_LEN = 63
 
 
 def _shorten_tool_name(name: str) -> str:
-    """生成确定性短名称: 截断前缀 + '_' + 8 位 SHA256 hex"""
+    """生成确定性短名称: 截断前缀 + '_' + 8 位 SHA256 hex（按 UTF-8 字节长度截断）"""
     hash_suffix = hashlib.sha256(name.encode()).hexdigest()[:8]
-    prefix_max = TOOL_NAME_MAX_LEN - 1 - 8  # 54 prefix + 1 underscore + 8 hash = 63
-    prefix = name[:prefix_max]
+    prefix_max_bytes = TOOL_NAME_MAX_LEN - 1 - 8  # 54 bytes prefix + 1 underscore + 8 hash = 63
+    # 按 UTF-8 字节长度截断，避免多字节字符编码后超长
+    encoded = name.encode("utf-8")
+    if len(encoded) > prefix_max_bytes:
+        truncated = encoded[:prefix_max_bytes]
+        # 确保不切断多字节 UTF-8 字符
+        prefix = truncated.decode("utf-8", errors="ignore")
+    else:
+        prefix = name
     return f"{prefix}_{hash_suffix}"
 
 
