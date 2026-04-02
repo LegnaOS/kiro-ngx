@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, field_validator
 
-MAX_BUDGET_TOKENS = 24576  # 对齐 Go/kiro.rs，降低 thinking output 消耗
+MAX_BUDGET_TOKENS = 51200  # 50K thinking budget，平衡质量与token消耗
 
 
 # === 错误响应 ===
