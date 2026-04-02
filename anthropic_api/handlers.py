@@ -1383,7 +1383,8 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
         "id": f"msg_{uuid.uuid4().hex}", "type": "message", "role": "assistant",
         "content": content, "model": model,
         "stop_reason": stop_reason, "stop_sequence": None,
-        "usage": {"input_tokens": final_input, "output_tokens": output_tokens},
+        "usage": {"input_tokens": final_input, "output_tokens": output_tokens,
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
     })
 
 
@@ -1586,7 +1587,8 @@ def _make_final_delta_sse(input_tokens: int, output_tokens: int, stop_reason: st
     return SseEvent("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
     })
 
 

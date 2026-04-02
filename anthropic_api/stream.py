@@ -189,7 +189,8 @@ class SseStateManager:
             events.append(SseEvent("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": self.get_stop_reason(), "stop_sequence": None},
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
             }))
         if not self.message_ended:
             self.message_ended = True
@@ -253,7 +254,8 @@ class StreamContext:
                 "id": self.message_id, "type": "message", "role": "assistant",
                 "content": [], "model": self.model,
                 "stop_reason": None, "stop_sequence": None,
-                "usage": {"input_tokens": self.input_tokens, "output_tokens": 1},
+                "usage": {"input_tokens": self.input_tokens, "output_tokens": 1,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
             },
         }
 
